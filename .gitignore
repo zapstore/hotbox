@@ -1,0 +1,7 @@
+/hotbox
+/test
+*.hotbox
+*.jks
+*.keystore
+*.p12
+*.pfx
