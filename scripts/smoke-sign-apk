@@ -1,0 +1,17 @@
+#!/bin/sh
+set -eu
+
+: "${HOTBOX_SOCKET:?set HOTBOX_SOCKET to the running Hotbox Unix socket}"
+: "${HOTBOX_ALIAS:?set HOTBOX_ALIAS to the Android signing alias}"
+
+fixture=${1:-testdata/hotbox-unsigned.apk}
+output="$(dirname "$fixture")/hotbox-smoke-$$.apk"
+trap 'rm -f "$output"' EXIT
+
+curl --silent --show-error --fail-with-body \
+  --unix-socket "$HOTBOX_SOCKET" \
+  -X POST http://localhost/v1/apk/sign \
+  -H 'Content-Type: application/json' \
+  --data "{\"apk\":\"$fixture\",\"output\":\"$output\",\"alias\":\"$HOTBOX_ALIAS\"}"
+
+apksigner verify --verbose "$output"

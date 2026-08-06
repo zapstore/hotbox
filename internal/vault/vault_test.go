@@ -92,8 +92,7 @@ func testData() Data {
 	data := New()
 	data.NostrKey = strings.Repeat("1", 64)
 	data.Keystores["release"] = Keystore{
-		Name: "release", Bytes: []byte("not-a-real-keystore"),
-		StorePass: "store", KeyAlias: "app", KeyPass: "key",
+		Name: "release", Bytes: []byte("not-a-real-keystore"), Aliases: []string{"app"},
 	}
 	return data
 }

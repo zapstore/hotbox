@@ -1,0 +1,13 @@
+#!/bin/sh
+set -eu
+
+output=${1:-testdata/hotbox-unsigned.apk}
+tmp=$(mktemp -d)
+trap 'rm -rf "$tmp"' EXIT
+
+cat >"$tmp/AndroidManifest.xml" <<'EOF'
+<manifest package="org.zapstore.hotbox.fixture"><application /></manifest>
+EOF
+
+mkdir -p "$(dirname "$output")"
+aapt package -f -M "$tmp/AndroidManifest.xml" -F "$output"

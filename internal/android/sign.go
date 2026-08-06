@@ -21,7 +21,10 @@ type Result struct {
 
 // SignAPK signs a finished, unsigned APK. It never runs Gradle or interprets
 // build configuration supplied by the caller.
-func SignAPK(ctx context.Context, workspace, input, output string, key vault.Keystore) (Result, error) {
+func SignAPK(ctx context.Context, workspace, input, output string, key vault.Keystore, alias, password string, overwrite bool) (Result, error) {
+	if !hasAlias(key.Aliases, alias) {
+		return Result{}, fmt.Errorf("unknown signing alias")
+	}
 	workspace, err := filepath.EvalSymlinks(workspace)
 	if err != nil {
 		return Result{}, fmt.Errorf("resolve workspace: %w", err)
@@ -35,7 +38,7 @@ func SignAPK(ctx context.Context, workspace, input, output string, key vault.Key
 		return Result{}, err
 	}
 	if !within(workspace, input) {
-		return Result{}, fmt.Errorf("input must be inside the configured workspace")
+		return Result{}, fmt.Errorf("input must be inside the configured workspace (%s)", workspace)
 	}
 	if output == "" {
 		output = strings.TrimSuffix(input, ".apk") + "-signed.apk"
@@ -44,9 +47,10 @@ func SignAPK(ctx context.Context, workspace, input, output string, key vault.Key
 	if err != nil {
 		return Result{}, err
 	}
-	if _, err := os.Lstat(output); err == nil {
-		return Result{}, fmt.Errorf("refusing to overwrite existing output")
-	} else if !os.IsNotExist(err) {
+	if output == input {
+		return Result{}, fmt.Errorf("output must differ from input")
+	}
+	if err := checkOutput(output, overwrite); err != nil {
 		return Result{}, err
 	}
 	apksigner, zipalign, err := tools()
@@ -85,17 +89,17 @@ func SignAPK(ctx context.Context, workspace, input, output string, key vault.Key
 	signed := filepath.Join(tmp, "signed.apk")
 	cmd := toolchain.Command(ctx, apksigner, "sign",
 		"--ks", keystore,
-		"--ks-key-alias", key.KeyAlias,
+		"--ks-key-alias", alias,
 		"--ks-pass", "stdin",
 		"--key-pass", "stdin",
 		"--out", signed,
 		aligned,
 	)
 	var passwordInput bytes.Buffer
-	passwordInput.Grow(len(key.StorePass) + len(key.KeyPass) + 2)
-	passwordInput.WriteString(key.StorePass)
+	passwordInput.Grow(2*len(password) + 2)
+	passwordInput.WriteString(password)
 	passwordInput.WriteByte('\n')
-	passwordInput.WriteString(key.KeyPass)
+	passwordInput.WriteString(password)
 	passwordInput.WriteByte('\n')
 	defer clear(passwordInput.Bytes())
 	cmd.Stdin = &passwordInput
@@ -108,10 +112,19 @@ func SignAPK(ctx context.Context, workspace, input, output string, key vault.Key
 	if err != nil {
 		return Result{}, fmt.Errorf("signed APK verification failed: %w", err)
 	}
-	if err := publishFile(signed, output); err != nil {
+	if err := publishFile(signed, output, overwrite); err != nil {
 		return Result{}, err
 	}
 	return Result{Output: output, CertificateSHA256: certificateDigest(string(commandOutput))}, nil
+}
+
+func hasAlias(aliases []string, target string) bool {
+	for _, alias := range aliases {
+		if alias == target {
+			return true
+		}
+	}
+	return false
 }
 
 func canonicalAPK(path string) (string, error) {
@@ -150,6 +163,18 @@ func outputPath(input, output string) (string, error) {
 		return "", fmt.Errorf("output must be alongside the input APK")
 	}
 	return absolute, nil
+}
+
+func checkOutput(path string, overwrite bool) error {
+	if _, err := os.Lstat(path); err == nil {
+		if !overwrite {
+			return fmt.Errorf("refusing to overwrite existing output")
+		}
+		return nil
+	} else if !os.IsNotExist(err) {
+		return err
+	}
+	return nil
 }
 
 func within(root, path string) bool {
@@ -240,7 +265,7 @@ func copyRegularFile(source, destination string, mode os.FileMode) error {
 	return nil
 }
 
-func publishFile(source, destination string) error {
+func publishFile(source, destination string, overwrite bool) error {
 	staged, err := os.CreateTemp(filepath.Dir(destination), ".hotbox-signed-*.apk")
 	if err != nil {
 		return err
@@ -265,6 +290,12 @@ func publishFile(source, destination string) error {
 	}
 	if err := staged.Close(); err != nil {
 		return err
+	}
+	if overwrite {
+		if err := os.Rename(stagedPath, destination); err != nil {
+			return err
+		}
+		return nil
 	}
 	if err := os.Link(stagedPath, destination); err != nil {
 		if os.IsExist(err) {

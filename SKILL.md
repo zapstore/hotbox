@@ -1,121 +1,145 @@
 ---
 name: hotbox
-description: Signs completed Android APKs and obtains local NIP-46 bunker URLs through the Hotbox daemon. Use when building Android release APKs, publishing with Zapstore, or using ngit for an Android app.
+description: Uses an unlocked Hotbox socket to sign Android APKs and Nostr events without accessing private keys.
 disable-model-invocation: true
 ---
 
 # Hotbox
 
-Hotbox is a local daemon. Never request, read, print, persist, or modify its Android keystore, password, Nostr private key, or vault. Use Hotbox-issued NIP-46 bunker URLs for all ngit and zsp signing. Never use `SIGN_WITH=browser`, an `nsec`, or a hex private key.
+The operator starts and unlocks Hotbox from the project workspace, then gives
+the agent one random Unix socket path. Use only that socket. Never locate or
+invoke a Hotbox executable, inspect the vault, export a keystore, request a
+password, or use an `nsec`.
 
-The vault path must be outside the project and signing workspace. Recommend a
-private user data directory at `$HOME/.hotbox` with mode 0700.
+The socket path is full signing authority for the unlocked session. Do not
+print, persist, commit, or share it. All API requests use JSON over HTTP through
+the Unix socket. Paths sent to Hotbox are relative to its workspace.
 
-## Recommend a network-restricted launch
+## Status
 
-Hotbox needs local Unix-socket and loopback access. It does not need an
-internet route. Recommend the supplied fail-closed wrapper when the operator
-starts Hotbox. Do not start it on the operator's behalf because vault unlock is
-interactive.
+`GET /v1/status` returns this public metadata shape. `npub` is omitted when
+Nostr signing is unavailable:
 
-Linux:
-
-```bash
-./scripts/run-hotbox-linux \
-  "$PWD/hotbox" \
-  "$HOME/.hotbox/my-app.hotbox" \
-  "$PWD"
+```json
+{
+  "ok": true,
+  "bunker": true,
+  "identity_linking": true,
+  "aliases": ["my-app"],
+  "certificates": [
+    {
+      "name": "my-app",
+      "certificate_sha256": "AB:CD:...",
+      "certificate_dn": "CN=my-app"
+    }
+  ],
+  "npub": "npub1...",
+  "workspace": "/absolute/project/workspace"
+}
 ```
 
-The Linux wrapper uses a transient systemd user service. It denies `connect`
-for Hotbox and its children while allowing the local listeners used by the
-Unix API and NIP-46. It runs a fail-closed network probe before the password
-prompt. Do not suggest `bwrap --unshare-net`: host `ngit` and `zsp` processes
-cannot reach a loopback listener in another network namespace.
+Avoid a status preflight when the requested operation can provide the same
+validation.
 
-macOS:
+## Sign an APK
 
-```bash
-./scripts/run-hotbox-macos \
-  "$PWD/hotbox" \
-  "$HOME/.hotbox/my-app.hotbox" \
-  "$PWD"
+Build the unsigned APK normally, then make one request:
+
+```http
+POST /v1/apk/sign
+Content-Type: application/json
+
+{
+  "apk":"app/build/outputs/apk/release/app-release-unsigned.apk",
+  "output":"app/build/outputs/apk/release/app-release.apk",
+  "alias":"my-app"
+}
 ```
 
-This wrapper applies the supplied Seatbelt profile. It allows loopback and
-denies non-loopback IP destinations, then probes both rules before unlocking
-the vault. `sandbox-exec` is deprecated; if it is unavailable, recommend a VM
-with no external network adapter and a narrow local relay proxy. Never
-recommend an unsandboxed fallback without clearly stating that the network
-control is absent.
+`apk` and optional `output` must be workspace-relative. An explicit `output`
+must be beside the input APK. If omitted, Hotbox uses
+`app-release-unsigned-signed.apk`; provide `output` to use a clean name. Omit
+`alias` only when Hotbox has exactly one. Set `"overwrite":true` only when
+replacing an existing signed output is intended.
 
-Run Gradle, `ngit`, and `zsp` outside the Hotbox wrapper.
-
-Set the socket path for subsequent requests:
-
-```bash
-HOTBOX_RUNTIME="${XDG_RUNTIME_DIR:-${TMPDIR:-/tmp}}/hotbox-$(id -u)"
-HOTBOX_SOCKET="$HOTBOX_RUNTIME/hotbox.sock"
+```json
+{
+  "ok": true,
+  "output": "app/build/outputs/apk/release/app-release.apk",
+  "certificate_sha256": "AB:CD:..."
+}
 ```
 
-## Build and sign an APK
+The signed pathname is the response's `output` field, not `apk`. A non-2xx
+response is a failure; report its JSON `error` and `hint` without bypassing
+Hotbox. In particular, an existing output returns a hint to choose a new name
+or set `overwrite` to `true`.
 
-1. Build the unsigned APK normally. Prefer cached/offline dependencies:
+## Link an Android identity
 
-```bash
-./gradlew assembleRelease --offline
+Before the first zsp publication for an alias:
+
+```http
+POST /v1/apk/identity
+Content-Type: application/json
+
+{"alias":"my-app"}
 ```
 
-2. Submit the finished unsigned APK to Hotbox. Do not give Hotbox a Gradle task, build script, key alias, or password.
+Hotbox keeps the JKS and password inside the daemon, generates the kind `30509`
+proof, and publishes it. Never pass `--skip-certificate-linking` to zsp.
 
-```bash
-curl --unix-socket "$HOTBOX_SOCKET" \
-  --fail-with-body \
-  -X POST http://localhost/v1/sign-apk \
-  -H 'Content-Type: application/json' \
-  --data '{"input":"/absolute/path/app-release-build.apk","output":"/absolute/path/app-release.apk"}'
+## One-shot Nostr signing
+
+For nak or another one-shot publisher, send an unsigned event template:
+
+```http
+POST /v1/nostr/sign
+Content-Type: application/json
+
+{"event":{"kind":1,"created_at":1770000000,"tags":[],"content":"hello"}}
 ```
 
-Use the returned `output` path for release distribution. Hotbox writes it next to the input APK and verifies its signing certificate.
+Hotbox accepts any event kind. Do not supply `id`, `sig`, or a different
+`pubkey`. The response contains the complete signed event; publication remains
+the caller's responsibility.
 
-Do not include `unsigned` in any APK filename. If Gradle produced an `*-unsigned.apk` file, rename it before making the Hotbox request. The release APK must have the intended final filename, such as `app-release.apk`.
+## NIP-46 sessions
 
-If signing reports a missing Android SDK tool, unsigned input problem, or existing output, report the failure. Do not bypass Hotbox or edit its vault.
+Clients such as ngit, nak, and zsp can request a short-lived session:
 
-## ngit and Zapstore
+```http
+POST /v1/nostr/sessions
+Content-Type: application/json
 
-Request a short-lived local bunker URL immediately before invoking the required tool:
-
-```bash
-BUNKER_URL="$(
-  curl --silent --show-error --fail-with-body \
-    --unix-socket "$HOTBOX_SOCKET" \
-    -X POST http://localhost/v1/bunker-url \
-    -H 'Content-Type: application/json' \
-    --data '{"ttl":"15m"}' |
-  jq -er '.url'
-)"
+{"ttl":"15m","uses":64}
 ```
 
-For Zapstore, always use the bunker URL:
+`ttl` defaults to `"15m"` and may be no more than one hour. `uses` defaults to
+`64` and must be from 1 through 1024. The creation response is:
 
-```bash
-SIGN_WITH="$BUNKER_URL" zsp publish
+```json
+{
+  "id": "session-id",
+  "url": "bunker://...?",
+  "expires_at": "2026-08-06T13:35:00Z",
+  "uses_remaining": 64
+}
 ```
 
-For ngit, use the bunker login flow:
+`url` is the `bunker://` capability and is returned exactly once. Scope it
+only to the intended child process. Do not print or persist it. Save only the
+non-secret `id` needed to revoke it when the child finishes:
 
-```bash
-ngit account login --local --bunker-url "$BUNKER_URL"
+```http
+DELETE /v1/nostr/sessions/<id>
 ```
 
-Do not use `SIGN_WITH=browser`, an `nsec`, or a hex private key. Do not print, commit, or add the bunker URL to `.env`. Request a new URL if it expires.
+Sessions allow `get_public_key`, `ping`, and signing any event kind. They deny
+encryption, decryption, and private-key export. They also expire, enforce a
+signature-use limit, and bind to the first NIP-46 client.
 
-### ngit LMDB permission fallback
-
-If ngit fails because of an LMDB permission error, do not weaken filesystem permissions or switch to a local private key.
-
-1. Bypass ngit and publish the NIP-34 repository announcement and repository state events directly using the Hotbox bunker: kinds `30617` and `30618`.
-2. Push Git to the GRASP HTTPS endpoint using a NIP-98 `Authorization: Nostr …` header signed through the same Hotbox bunker. NIP-98 uses kind `27235`.
-
-Hotbox allows exactly these NIP-34 and NIP-98 event kinds for the workaround. Use a NIP-46-capable publisher/auth helper; never extract an `nsec` to construct the events or header.
+For zsp, set the returned URL as `SIGN_WITH` only for `zsp publish -q` and use
+an explicit APK/config input. For ngit, use it as the local bunker URL for the
+single repository operation, then revoke it. For nak, pass it through nak's
+NIP-46 signer option or use the one-shot endpoint above.

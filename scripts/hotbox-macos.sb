@@ -1,7 +1,0 @@
-(version 1)
-
-; Hotbox must accept local Unix-socket and loopback clients, but it has no
-; reason to send traffic to a non-loopback address.
-(allow default)
-(deny network-outbound (remote ip "*:*"))
-(allow network-outbound (remote ip "localhost:*"))

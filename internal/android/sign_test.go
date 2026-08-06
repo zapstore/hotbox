@@ -26,13 +26,13 @@ verify)
 	exit 1
 	;;
 sign)
-	case " $* " in
-	*"store secret"*|*"key secret"*) exit 70 ;;
+case " $* " in
+*"store secret"*) exit 70 ;;
 	esac
 	IFS= read -r store
 	IFS= read -r key
 	[ "$store" = "store secret" ] || exit 71
-	[ "$key" = "key secret" ] || exit 72
+[ "$key" = "store secret" ] || exit 72
 	out=
 	last=
 	shift
@@ -63,11 +63,9 @@ esac
 		t.Fatal(err)
 	}
 	result, err := SignAPK(context.Background(), dir, input, output, vault.Keystore{
-		Bytes:     []byte("test keystore"),
-		StorePass: "store secret",
-		KeyAlias:  "release",
-		KeyPass:   "key secret",
-	})
+		Bytes:   []byte("test keystore"),
+		Aliases: []string{"release"},
+	}, "release", "store secret", false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -89,7 +87,7 @@ func TestPublishFileRefusesOverwrite(t *testing.T) {
 	if err := os.WriteFile(destination, []byte("old"), 0600); err != nil {
 		t.Fatal(err)
 	}
-	err := publishFile(source, destination)
+	err := publishFile(source, destination, false)
 	if err == nil || !strings.Contains(err.Error(), "refusing to overwrite") {
 		t.Fatalf("publishFile error = %v", err)
 	}
@@ -99,6 +97,57 @@ func TestPublishFileRefusesOverwrite(t *testing.T) {
 	}
 	if string(got) != "old" {
 		t.Fatalf("destination changed to %q", got)
+	}
+}
+
+func TestPublishFileOverwritesWhenExplicit(t *testing.T) {
+	dir := t.TempDir()
+	source := filepath.Join(dir, "source.apk")
+	destination := filepath.Join(dir, "destination.apk")
+	if err := os.WriteFile(source, []byte("new"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(destination, []byte("old"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := publishFile(source, destination, true); err != nil {
+		t.Fatal(err)
+	}
+	got, err := os.ReadFile(destination)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "new" {
+		t.Fatalf("destination = %q", got)
+	}
+}
+
+func TestCheckOutputAllowsExplicitOverwrite(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "output.apk")
+	if err := os.WriteFile(path, []byte("existing"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := checkOutput(path, true); err != nil {
+		t.Fatalf("explicit overwrite rejected: %v", err)
+	}
+	if err := checkOutput(path, false); err == nil {
+		t.Fatal("implicit overwrite was allowed")
+	}
+}
+
+func TestSignAPKReportsConfiguredWorkspace(t *testing.T) {
+	workspace := t.TempDir()
+	outside := filepath.Join(t.TempDir(), "app.apk")
+	if err := os.WriteFile(outside, []byte("test APK"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	resolvedWorkspace, err := filepath.EvalSymlinks(workspace)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = SignAPK(t.Context(), workspace, outside, "", vault.Keystore{Aliases: []string{"app"}}, "app", "password", false)
+	if err == nil || !strings.Contains(err.Error(), "configured workspace ("+resolvedWorkspace+")") {
+		t.Fatalf("SignAPK error = %v", err)
 	}
 }
 
