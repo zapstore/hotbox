@@ -67,6 +67,7 @@ func SignAPK(ctx context.Context, workspace, input, output string, key vault.Key
 		return Result{}, err
 	}
 	keystore := filepath.Join(tmp, "release.jks")
+	defer os.Remove(keystore)
 	if err := os.WriteFile(keystore, key.Bytes, 0600); err != nil {
 		return Result{}, err
 	}
@@ -105,6 +106,9 @@ func SignAPK(ctx context.Context, workspace, input, output string, key vault.Key
 	cmd.Stdin = &passwordInput
 	if err := cmd.Run(); err != nil {
 		return Result{}, fmt.Errorf("apksigner failed: %w", err)
+	}
+	if err := os.Remove(keystore); err != nil {
+		return Result{}, fmt.Errorf("remove temporary keystore: %w", err)
 	}
 	verify := toolchain.Command(ctx, apksigner, "verify", "--verbose", "--print-certs", signed)
 	commandOutput, err := verify.CombinedOutput()

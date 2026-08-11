@@ -559,6 +559,7 @@ func createKeystore(ctx context.Context, alias, password, commonName string) ([]
 		return nil, err
 	}
 	path := filepath.Join(tmp, "release.jks")
+	defer os.Remove(path)
 	command := toolchain.Command(ctx, keytool,
 		"-genkeypair", "-storetype", "JKS", "-keystore", path,
 		"-alias", alias, "-keyalg", "RSA", "-keysize", "4096", "-validity", "10000",
@@ -582,6 +583,10 @@ func createKeystore(ctx context.Context, alias, password, commonName string) ([]
 	if err != nil {
 		return nil, err
 	}
+	if err := os.Remove(path); err != nil {
+		clear(bytes)
+		return nil, fmt.Errorf("remove temporary keystore: %w", err)
+	}
 	fmt.Fprintln(os.Stderr, "Created a new Android keystore inside the encrypted vault.")
 	return bytes, nil
 }
@@ -600,6 +605,7 @@ func addKeyAlias(ctx context.Context, contents []byte, alias, password, commonNa
 		return nil, err
 	}
 	path := filepath.Join(tmp, "release.jks")
+	defer os.Remove(path)
 	if err := os.WriteFile(path, contents, 0600); err != nil {
 		return nil, err
 	}
@@ -619,7 +625,15 @@ func addKeyAlias(ctx context.Context, contents []byte, alias, password, commonNa
 	if err := command.Run(); err != nil {
 		return nil, fmt.Errorf("keytool add alias failed: %w", err)
 	}
-	return readRegularFile(path, maxKeystoreSize)
+	updated, err := readRegularFile(path, maxKeystoreSize)
+	if err != nil {
+		return nil, err
+	}
+	if err := os.Remove(path); err != nil {
+		clear(updated)
+		return nil, fmt.Errorf("remove temporary keystore: %w", err)
+	}
+	return updated, nil
 }
 
 func certificateAliases(ctx context.Context, key vault.Keystore, password string) ([]api.Alias, error) {
@@ -636,6 +650,7 @@ func certificateAliases(ctx context.Context, key vault.Keystore, password string
 		return nil, err
 	}
 	path := filepath.Join(tmp, "release.jks")
+	defer os.Remove(path)
 	if err := os.WriteFile(path, key.Bytes, 0600); err != nil {
 		return nil, err
 	}
@@ -663,6 +678,9 @@ func certificateAliases(ctx context.Context, key vault.Keystore, password string
 			return nil, fmt.Errorf("inspect certificate for alias %q: missing certificate metadata", name)
 		}
 		aliases = append(aliases, certificate)
+	}
+	if err := os.Remove(path); err != nil {
+		return nil, fmt.Errorf("remove temporary keystore: %w", err)
 	}
 	return aliases, nil
 }

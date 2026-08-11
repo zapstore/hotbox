@@ -77,13 +77,18 @@ func generate(
 		return nostr.Event{}, err
 	}
 	source := filepath.Join(scratch, "source.jks")
+	defer os.Remove(source)
 	if err := os.WriteFile(source, key.Bytes, 0600); err != nil {
 		return nostr.Event{}, err
 	}
 	keystore := filepath.Join(scratch, "release.jks")
+	defer os.Remove(keystore)
 	transientPassword, err := rekey(ctx, keytool, source, keystore, alias, password)
 	if err != nil {
 		return nostr.Event{}, err
+	}
+	if err := os.Remove(source); err != nil {
+		return nostr.Event{}, fmt.Errorf("remove source keystore: %w", err)
 	}
 	defer clear(transientPassword)
 
@@ -111,6 +116,9 @@ func generate(
 	command.Stderr = &stderr
 	if err := command.Run(); err != nil {
 		return nostr.Event{}, fmt.Errorf("zsp identity failed: %w: %s", err, sanitized(stderr.String()))
+	}
+	if err := os.Remove(keystore); err != nil {
+		return nostr.Event{}, fmt.Errorf("remove transient keystore: %w", err)
 	}
 	var event nostr.Event
 	decoder := json.NewDecoder(bytes.NewReader(stdout.Bytes()))
