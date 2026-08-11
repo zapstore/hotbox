@@ -1,5 +1,16 @@
 # Hotbox security model
 
+> [!WARNING]
+> Hotbox is alpha software and has not received an independent security audit.
+> It handles Android and Nostr signing keys, so defects can result in key
+> compromise or unauthorized signatures. Use only disposable or otherwise
+> recoverable keys until you have assessed these risks for your environment.
+
+## Reporting vulnerabilities
+
+Do not report security issues in public. Send details to
+[`security@zapstore.dev`](mailto:security@zapstore.dev).
+
 Hotbox keeps one Android keystore and one Nostr private key in an encrypted
 vault. The daemon decrypts them after an interactive password prompt. Private
 material stays in the Hotbox process except while `apksigner` reads a temporary
