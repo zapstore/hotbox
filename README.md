@@ -7,7 +7,8 @@ Local Android signing daemon and Nostr signer. It never runs Gradle. Read
 
 Use Hotbox if you want agents or local tools to sign APKs and Nostr events
 without holding the vault password, JKS, or `nsec`. You unlock it, agents get
-only a Unix socket path. Ideal for publishing Android apps to [Zapstore](https://zapstore.dev).
+only a Unix socket path. Agents should follow [SKILL.md](SKILL.md). Ideal for
+publishing Android apps to [Zapstore](https://zapstore.dev).
 
 Skip it if you need CI signing, multi-user access, or a Gradle plugin.
 
