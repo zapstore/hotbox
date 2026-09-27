@@ -1,9 +1,10 @@
-// Package vault stores signing material encrypted at rest.
+// Package vault seals one Nostr secret key with a password.
 package vault
 
 import (
 	"bytes"
 	"crypto/rand"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -11,7 +12,6 @@ import (
 	"io"
 	"os"
 	"path/filepath"
-	"strings"
 
 	nostr "github.com/nbd-wtf/go-nostr"
 	"golang.org/x/crypto/argon2"
@@ -19,124 +19,83 @@ import (
 )
 
 const (
+	version   = 1
 	saltSize  = 16
 	keySize   = chacha20poly1305.KeySize
 	timeCost  = 3
 	memoryKiB = 64 * 1024
 	threads   = 4
 
-	maxVaultFileSize = 16 << 20
-	maxKeystoreSize  = 8 << 20
-	maxPasswordSize  = 4 << 10
+	maxFileSize     = 1 << 20
+	maxPasswordSize = 4 << 10
 )
 
-type Keystore struct {
-	Name    string   `json:"name"`
-	Bytes   []byte   `json:"bytes"`
-	Aliases []string `json:"aliases"`
-}
-
-type Data struct {
-	Keystores map[string]Keystore `json:"keystores"`
-	NostrKey  string              `json:"nostr_key"`
-}
+var aad = []byte("hotbox-identity-v1")
 
 type file struct {
-	Version    int    `json:"version"`
-	Salt       []byte `json:"salt"`
-	Ciphertext []byte `json:"ciphertext"`
+	Version int    `json:"version"`
+	KDF     kdf    `json:"kdf"`
+	Wrap    []byte `json:"wrap"`
+	Data    []byte `json:"data"`
 }
 
-func New() Data { return Data{Keystores: make(map[string]Keystore)} }
-
-// Destroy releases references to decrypted material and zeroes mutable key
-// bytes. Go strings cannot be reliably wiped, so process-level dump controls
-// remain part of the security boundary.
-func (data *Data) Destroy() {
-	for name, key := range data.Keystores {
-		clear(key.Bytes)
-		key.Bytes = nil
-		delete(data.Keystores, name)
-	}
-	data.NostrKey = ""
+type kdf struct {
+	Salt    []byte `json:"salt"`
+	Time    uint32 `json:"time"`
+	Memory  uint32 `json:"memory"`
+	Threads uint8  `json:"threads"`
 }
 
-func Load(path, password string) (Data, error) {
-	if err := validPassword(password, false); err != nil {
-		return Data{}, err
-	}
-	// #nosec G304 -- the operator selects the vault path; the opened descriptor
-	// is required to be a bounded regular file before it is decoded.
-	input, err := os.Open(path)
-	if err != nil {
-		return Data{}, err
-	}
-	defer input.Close()
-	info, err := input.Stat()
-	if err != nil {
-		return Data{}, err
-	}
-	if !info.Mode().IsRegular() || info.Size() > maxVaultFileSize {
-		return Data{}, errors.New("vault must be a regular file no larger than 16 MiB")
-	}
-	raw, err := io.ReadAll(io.LimitReader(input, maxVaultFileSize+1))
-	if err != nil {
-		return Data{}, err
-	}
-	if len(raw) > maxVaultFileSize {
-		return Data{}, errors.New("vault is too large")
-	}
-	var stored file
-	decoder := json.NewDecoder(bytes.NewReader(raw))
-	decoder.DisallowUnknownFields()
-	if err := decoder.Decode(&stored); err != nil {
-		return Data{}, fmt.Errorf("read vault: %w", err)
-	}
-	if err := requireEOF(decoder); err != nil {
-		return Data{}, fmt.Errorf("read vault: %w", err)
-	}
-	if stored.Version != 1 || len(stored.Salt) != saltSize || len(stored.Ciphertext) > maxVaultFileSize {
-		return Data{}, errors.New("unsupported or corrupt vault")
-	}
-	plain, err := decrypt(stored.Salt, password, stored.Ciphertext)
-	if err != nil {
-		return Data{}, errors.New("invalid password or corrupt vault")
-	}
-	defer clear(plain)
-	var data Data
-	if err := json.Unmarshal(plain, &data); err != nil {
-		return Data{}, fmt.Errorf("decode vault: %w", err)
-	}
-	if data.Keystores == nil {
-		data.Keystores = make(map[string]Keystore)
-	}
-	if err := validate(data); err != nil {
-		return Data{}, fmt.Errorf("decode vault: %w", err)
-	}
-	return data, nil
+const stateSize = 1 + 32 + 32 + 16 + 2 + 2
+
+// State is the sealed bunker identity. Ports, path token, and connect secret
+// are fixed at creation so the bunker URL does not change between runs.
+type State struct {
+	Secret  [32]byte
+	Connect [32]byte
+	Token   [16]byte
+	WSPort  uint16
+	WSSPort uint16
 }
 
-func Save(path, password string, data Data) error {
+func (s *State) Wipe() { *s = State{} }
+
+// Create seals state into a new mode-0600 file. It refuses to replace an existing file.
+func Create(path, password string, state State) error {
 	if err := validPassword(password, true); err != nil {
 		return err
 	}
-	if err := validate(data); err != nil {
+	if err := state.valid(); err != nil {
 		return err
 	}
-	plain, err := json.Marshal(data)
-	if err != nil {
-		return fmt.Errorf("encode vault: %w", err)
-	}
-	defer clear(plain)
 	salt := make([]byte, saltSize)
 	if _, err := rand.Read(salt); err != nil {
 		return fmt.Errorf("generate salt: %w", err)
 	}
-	ciphertext, err := encrypt(salt, password, plain)
+	dek := make([]byte, keySize)
+	if _, err := rand.Read(dek); err != nil {
+		clear(dek)
+		return fmt.Errorf("generate data key: %w", err)
+	}
+	defer clear(dek)
+	kek := derive(salt, password)
+	defer clear(kek)
+	wrap, err := seal(kek, dek, wrapAAD(salt))
 	if err != nil {
 		return err
 	}
-	stored, err := json.Marshal(file{Version: 1, Salt: salt, Ciphertext: ciphertext})
+	plain := state.marshal()
+	defer clear(plain)
+	data, err := seal(dek, plain, aad)
+	if err != nil {
+		return err
+	}
+	stored, err := json.Marshal(file{
+		Version: version,
+		KDF:     kdf{Salt: salt, Time: timeCost, Memory: memoryKiB, Threads: threads},
+		Wrap:    wrap,
+		Data:    data,
+	})
 	if err != nil {
 		return err
 	}
@@ -146,39 +105,107 @@ func Save(path, password string, data Data) error {
 	return createExclusive(path, stored)
 }
 
-// Replace atomically replaces an existing vault after encrypting validated
-// data. It is used for explicit identity changes such as adding a signing
-// alias; new vault creation must use Save instead.
-func Replace(path, password string, data Data) error {
+// Open decrypts a vault. The caller must Wipe the returned state.
+// A wrong password and a damaged file return the same error.
+func Open(path, password string) (State, error) {
+	var state State
 	if err := validPassword(password, false); err != nil {
-		return err
+		return state, err
 	}
-	if err := validate(data); err != nil {
-		return err
-	}
-	plain, err := json.Marshal(data)
+	raw, err := readRegular(path)
 	if err != nil {
-		return fmt.Errorf("encode vault: %w", err)
+		return state, err
+	}
+	var stored file
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&stored); err != nil || requireEOF(decoder) != nil {
+		return state, errors.New("unsupported or corrupt vault")
+	}
+	if stored.Version != version || !acceptable(stored.KDF) {
+		return state, errors.New("unsupported or corrupt vault")
+	}
+	kek := derive(stored.KDF.Salt, password)
+	defer clear(kek)
+	dek, err := open(kek, stored.Wrap, wrapAAD(stored.KDF.Salt))
+	if err != nil || len(dek) != keySize {
+		clear(dek)
+		return state, errors.New("invalid password or corrupt vault")
+	}
+	defer clear(dek)
+	plain, err := open(dek, stored.Data, aad)
+	if err != nil {
+		clear(plain)
+		return state, errors.New("invalid password or corrupt vault")
 	}
 	defer clear(plain)
-	salt := make([]byte, saltSize)
-	if _, err := rand.Read(salt); err != nil {
-		return fmt.Errorf("generate salt: %w", err)
-	}
-	ciphertext, err := encrypt(salt, password, plain)
+	state, err = unmarshalState(plain)
 	if err != nil {
-		return err
+		return State{}, errors.New("invalid password or corrupt vault")
 	}
-	stored, err := json.Marshal(file{Version: 1, Salt: salt, Ciphertext: ciphertext})
-	if err != nil {
-		return err
-	}
-	return replace(path, stored)
+	return state, nil
 }
 
-func encrypt(salt []byte, password string, plain []byte) ([]byte, error) {
-	key := derive(salt, password)
-	defer clear(key)
+func (s State) valid() error {
+	if _, err := nostr.GetPublicKey(hex.EncodeToString(s.Secret[:])); err != nil {
+		return errors.New("invalid Nostr private key")
+	}
+	if s.Connect == [32]byte{} || s.Token == [16]byte{} {
+		return errors.New("bunker secret is missing")
+	}
+	if s.WSPort == 0 || s.WSSPort == 0 || s.WSPort == s.WSSPort {
+		return errors.New("bunker ports are invalid")
+	}
+	return nil
+}
+
+func (s State) marshal() []byte {
+	buf := make([]byte, stateSize)
+	buf[0] = 1
+	copy(buf[1:33], s.Secret[:])
+	copy(buf[33:65], s.Connect[:])
+	copy(buf[65:81], s.Token[:])
+	binary.BigEndian.PutUint16(buf[81:83], s.WSPort)
+	binary.BigEndian.PutUint16(buf[83:85], s.WSSPort)
+	return buf
+}
+
+func unmarshalState(plain []byte) (State, error) {
+	var state State
+	if len(plain) != stateSize || plain[0] != 1 {
+		return state, errors.New("unsupported vault state")
+	}
+	copy(state.Secret[:], plain[1:33])
+	copy(state.Connect[:], plain[33:65])
+	copy(state.Token[:], plain[65:81])
+	state.WSPort = binary.BigEndian.Uint16(plain[81:83])
+	state.WSSPort = binary.BigEndian.Uint16(plain[83:85])
+	if err := state.valid(); err != nil {
+		return State{}, err
+	}
+	return state, nil
+}
+
+func acceptable(k kdf) bool {
+	return len(k.Salt) == saltSize && k.Time == timeCost && k.Memory == memoryKiB && k.Threads == threads
+}
+
+func wrapAAD(salt []byte) []byte {
+	var params [9]byte
+	binary.BigEndian.PutUint32(params[0:4], timeCost)
+	binary.BigEndian.PutUint32(params[4:8], memoryKiB)
+	params[8] = threads
+	out := make([]byte, 0, len(aad)+len(params)+len(salt))
+	out = append(out, aad...)
+	out = append(out, params[:]...)
+	return append(out, salt...)
+}
+
+func derive(salt []byte, password string) []byte {
+	return argon2.IDKey([]byte(password), salt, timeCost, memoryKiB, threads, keySize)
+}
+
+func seal(key, plain, extra []byte) ([]byte, error) {
 	aead, err := chacha20poly1305.NewX(key)
 	if err != nil {
 		return nil, err
@@ -187,12 +214,10 @@ func encrypt(salt []byte, password string, plain []byte) ([]byte, error) {
 	if _, err := rand.Read(nonce); err != nil {
 		return nil, err
 	}
-	return append(nonce, aead.Seal(nil, nonce, plain, nil)...), nil
+	return append(nonce, aead.Seal(nil, nonce, plain, extra)...), nil
 }
 
-func decrypt(salt []byte, password string, ciphertext []byte) ([]byte, error) {
-	key := derive(salt, password)
-	defer clear(key)
+func open(key, ciphertext, extra []byte) ([]byte, error) {
 	aead, err := chacha20poly1305.NewX(key)
 	if err != nil {
 		return nil, err
@@ -200,17 +225,7 @@ func decrypt(salt []byte, password string, ciphertext []byte) ([]byte, error) {
 	if len(ciphertext) < aead.NonceSize() {
 		return nil, errors.New("ciphertext too short")
 	}
-	return aead.Open(nil, ciphertext[:aead.NonceSize()], ciphertext[aead.NonceSize():], nil)
-}
-
-func derive(salt []byte, password string) []byte {
-	return argon2.IDKey([]byte(password), salt, timeCost, memoryKiB, threads, keySize)
-}
-
-func clear(b []byte) {
-	for i := range b {
-		b[i] = 0
-	}
+	return aead.Open(nil, ciphertext[:aead.NonceSize()], ciphertext[aead.NonceSize():], extra)
 }
 
 func validPassword(password string, creating bool) error {
@@ -226,41 +241,27 @@ func validPassword(password string, creating bool) error {
 	return nil
 }
 
-func validate(data Data) error {
-	if len(data.NostrKey) != 64 {
-		return errors.New("nostr private key must be 32-byte hex")
+func readRegular(path string) ([]byte, error) {
+	input, err := os.Open(path)
+	if err != nil {
+		return nil, err
 	}
-	if _, err := hex.DecodeString(data.NostrKey); err != nil {
-		return errors.New("nostr private key must be 32-byte hex")
+	defer input.Close()
+	info, err := input.Stat()
+	if err != nil {
+		return nil, err
 	}
-	if _, err := nostr.GetPublicKey(data.NostrKey); err != nil {
-		return errors.New("invalid Nostr private key")
+	if !info.Mode().IsRegular() || info.Size() > maxFileSize {
+		return nil, errors.New("vault must be a regular file no larger than 1 MiB")
 	}
-	if len(data.Keystores) == 0 || len(data.Keystores) > 8 {
-		return errors.New("vault must contain between one and eight keystores")
+	raw, err := io.ReadAll(io.LimitReader(input, maxFileSize+1))
+	if err != nil {
+		return nil, err
 	}
-	for name, key := range data.Keystores {
-		if strings.TrimSpace(name) == "" || len(name) > 255 || key.Name != name {
-			return errors.New("invalid keystore name")
-		}
-		if len(key.Bytes) == 0 || len(key.Bytes) > maxKeystoreSize {
-			return errors.New("invalid keystore size")
-		}
-		if len(key.Aliases) == 0 || len(key.Aliases) > 64 {
-			return errors.New("keystore must contain between one and 64 aliases")
-		}
-		seen := make(map[string]struct{}, len(key.Aliases))
-		for _, alias := range key.Aliases {
-			if strings.TrimSpace(alias) == "" || len(alias) > 255 {
-				return errors.New("invalid key alias")
-			}
-			if _, ok := seen[alias]; ok {
-				return errors.New("duplicate key alias")
-			}
-			seen[alias] = struct{}{}
-		}
+	if len(raw) > maxFileSize {
+		return nil, errors.New("vault is too large")
 	}
-	return nil
+	return raw, nil
 }
 
 func requireEOF(decoder *json.Decoder) error {
@@ -275,8 +276,7 @@ func requireEOF(decoder *json.Decoder) error {
 }
 
 func createExclusive(path string, contents []byte) error {
-	dir := filepath.Dir(path)
-	tmp, err := os.CreateTemp(dir, ".hotbox-vault-*")
+	tmp, err := os.CreateTemp(filepath.Dir(path), ".hotbox-vault-*")
 	if err != nil {
 		return err
 	}
@@ -304,28 +304,8 @@ func createExclusive(path string, contents []byte) error {
 	return nil
 }
 
-func replace(path string, contents []byte) error {
-	dir := filepath.Dir(path)
-	tmp, err := os.CreateTemp(dir, ".hotbox-vault-*")
-	if err != nil {
-		return err
+func clear(b []byte) {
+	for i := range b {
+		b[i] = 0
 	}
-	tmpPath := tmp.Name()
-	defer os.Remove(tmpPath)
-	if err := tmp.Chmod(0600); err != nil {
-		_ = tmp.Close()
-		return err
-	}
-	if _, err := tmp.Write(contents); err != nil {
-		_ = tmp.Close()
-		return err
-	}
-	if err := tmp.Sync(); err != nil {
-		_ = tmp.Close()
-		return err
-	}
-	if err := tmp.Close(); err != nil {
-		return err
-	}
-	return os.Rename(tmpPath, path)
 }

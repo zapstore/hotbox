@@ -1,98 +1,91 @@
 package vault
 
 import (
+	"bytes"
+	"encoding/hex"
 	"os"
 	"path/filepath"
-	"strings"
 	"testing"
 )
 
-func TestSaveLoadAndRejectWrongPassword(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "vault.json")
-	input := testData()
-	if err := Save(path, "correct horse battery staple", input); err != nil {
+func TestRoundTripHidesSecret(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "zapstore.hotbox")
+	state := testState(t)
+	password := "correct horse battery staple"
+	if err := Create(path, password, state); err != nil {
 		t.Fatal(err)
 	}
-	loaded, err := Load(path, "correct horse battery staple")
+	info, err := os.Stat(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := string(loaded.Keystores["release"].Bytes); got != "not-a-real-keystore" {
-		t.Fatalf("loaded bytes = %q", got)
-	}
-	if _, err := Load(path, "wrong"); err == nil {
-		t.Fatal("wrong password unexpectedly opened vault")
-	}
-}
-
-func TestDetectsTampering(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "vault.json")
-	if err := Save(path, "a secure password", testData()); err != nil {
-		t.Fatal(err)
+	if info.Mode().Perm() != 0600 {
+		t.Fatalf("mode = %o", info.Mode().Perm())
 	}
 	raw, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatal(err)
 	}
+	if bytes.Contains(raw, []byte(hex.EncodeToString(state.Secret[:]))) ||
+		bytes.Contains(raw, []byte(hex.EncodeToString(state.Connect[:]))) {
+		t.Fatal("vault file contains secret material")
+	}
+	opened, err := Open(path, password)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if opened != state {
+		t.Fatal("opened state does not match")
+	}
+	if _, err := Open(path, "wrong password!!"); err == nil {
+		t.Fatal("wrong password opened the vault")
+	}
 	raw[len(raw)-2] ^= 1
 	if err := os.WriteFile(path, raw, 0600); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := Load(path, "a secure password"); err == nil {
-		t.Fatal("tampered vault unexpectedly opened")
+	if _, err := Open(path, password); err == nil {
+		t.Fatal("tampered vault opened")
 	}
 }
 
-func TestSaveRefusesToOverwrite(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "vault.json")
-	if err := Save(path, "first password", testData()); err != nil {
+func TestCreateRefusesOverwrite(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "zapstore.hotbox")
+	state := testState(t)
+	if err := Create(path, "correct horse battery staple", state); err != nil {
 		t.Fatal(err)
 	}
 	before, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := Save(path, "second password", testData()); err == nil {
-		t.Fatal("Save overwrote an existing vault")
+	if err := Create(path, "another strong password", state); err == nil {
+		t.Fatal("Create overwrote an existing vault")
 	}
 	after, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if string(after) != string(before) {
+	if !bytes.Equal(before, after) {
 		t.Fatal("existing vault changed after refused overwrite")
 	}
 }
 
-func TestLoadRejectsOversizedVault(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "vault.json")
-	file, err := os.Create(path)
+func testState(t *testing.T) State {
+	t.Helper()
+	state := State{Secret: testSecret(t), WSPort: 17431, WSSPort: 17432}
+	state.Connect[0] = 9
+	state.Token[0] = 8
+	return state
+}
+
+func testSecret(t *testing.T) [32]byte {
+	t.Helper()
+	raw, err := hex.DecodeString("1111111111111111111111111111111111111111111111111111111111111111")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := file.Truncate(maxVaultFileSize + 1); err != nil {
-		t.Fatal(err)
-	}
-	if err := file.Close(); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := Load(path, "password"); err == nil {
-		t.Fatal("Load accepted an oversized vault")
-	}
-}
-
-func TestSaveRejectsWeakPassword(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "vault.json")
-	if err := Save(path, "short", testData()); err == nil {
-		t.Fatal("Save accepted a weak password")
-	}
-}
-
-func testData() Data {
-	data := New()
-	data.NostrKey = strings.Repeat("1", 64)
-	data.Keystores["release"] = Keystore{
-		Name: "release", Bytes: []byte("not-a-real-keystore"), Aliases: []string{"app"},
-	}
-	return data
+	var secret [32]byte
+	copy(secret[:], raw)
+	return secret
 }

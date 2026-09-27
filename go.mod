@@ -7,6 +7,7 @@ toolchain go1.25.12
 require (
 	github.com/charmbracelet/huh v1.0.0
 	github.com/coder/websocket v1.8.15
+	github.com/mattn/go-isatty v0.0.20
 	github.com/nbd-wtf/go-nostr v0.52.3
 	golang.org/x/crypto v0.54.0
 	golang.org/x/sys v0.47.0
@@ -40,7 +41,6 @@ require (
 	github.com/klauspost/cpuid/v2 v2.2.10 // indirect
 	github.com/lucasb-eyer/go-colorful v1.2.0 // indirect
 	github.com/mailru/easyjson v0.9.0 // indirect
-	github.com/mattn/go-isatty v0.0.20 // indirect
 	github.com/mattn/go-localereader v0.0.1 // indirect
 	github.com/mattn/go-runewidth v0.0.16 // indirect
 	github.com/mitchellh/hashstructure/v2 v2.0.2 // indirect
