@@ -1,9 +1,4 @@
 /hotbox
-/test
+/dist/
 *.hotbox
-*.jks
-*.keystore
-*.p12
-*.pfx
-
 .agents/skills
