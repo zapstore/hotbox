@@ -2,14 +2,16 @@ module github.com/zapstore/hotbox
 
 go 1.25.0
 
-toolchain go1.25.12
+toolchain go1.25.14
 
 require (
+	github.com/btcsuite/btcd/btcec/v2 v2.3.4
 	github.com/charmbracelet/huh v1.0.0
 	github.com/coder/websocket v1.8.15
+	github.com/decred/dcrd/dcrec/secp256k1/v4 v4.4.0
 	github.com/mattn/go-isatty v0.0.20
 	github.com/nbd-wtf/go-nostr v0.52.3
-	golang.org/x/crypto v0.54.0
+	golang.org/x/crypto v0.55.0
 	golang.org/x/sys v0.47.0
 )
 
@@ -17,7 +19,6 @@ require (
 	github.com/ImVexed/fasturl v0.0.0-20230304231329-4e41488060f3 // indirect
 	github.com/atotto/clipboard v0.1.4 // indirect
 	github.com/aymanbagabas/go-osc52/v2 v2.0.1 // indirect
-	github.com/btcsuite/btcd/btcec/v2 v2.3.4 // indirect
 	github.com/btcsuite/btcd/btcutil v1.1.5 // indirect
 	github.com/btcsuite/btcd/chaincfg/chainhash v1.1.0 // indirect
 	github.com/bytedance/sonic v1.13.1 // indirect
@@ -33,7 +34,6 @@ require (
 	github.com/charmbracelet/x/term v0.2.1 // indirect
 	github.com/cloudwego/base64x v0.1.5 // indirect
 	github.com/decred/dcrd/crypto/blake256 v1.1.0 // indirect
-	github.com/decred/dcrd/dcrec/secp256k1/v4 v4.4.0 // indirect
 	github.com/dustin/go-humanize v1.0.1 // indirect
 	github.com/erikgeiser/coninput v0.0.0-20211004153227-1c3628e74d0f // indirect
 	github.com/josharian/intern v1.0.0 // indirect
@@ -59,5 +59,5 @@ require (
 	golang.org/x/arch v0.15.0 // indirect
 	golang.org/x/exp v0.0.0-20250305212735-054e65f0b394 // indirect
 	golang.org/x/sync v0.22.0 // indirect
-	golang.org/x/text v0.40.0 // indirect
+	golang.org/x/text v0.41.0 // indirect
 )

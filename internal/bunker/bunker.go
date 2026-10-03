@@ -1,6 +1,6 @@
 // Package bunker is a loopback NIP-46 signer.
 // It listens on 127.0.0.1 with ws and wss and does not dial the network.
-// Clients such as zsp use the bunker URL as SIGN_WITH.
+// One vault identity has one bunker URL. Any program that has that URL can connect.
 package bunker
 
 import (
@@ -26,8 +26,6 @@ import (
 	"github.com/coder/websocket"
 	"github.com/coder/websocket/wsjson"
 	gonostr "github.com/nbd-wtf/go-nostr"
-	"github.com/nbd-wtf/go-nostr/nip04"
-	"github.com/nbd-wtf/go-nostr/nip44"
 	"github.com/nbd-wtf/go-nostr/nip46"
 )
 
@@ -36,26 +34,32 @@ const (
 	maxSubs    = 8
 	maxRecent  = 32
 	maxSubID   = 128
-
-	// localClientKey is the NIP-46 client key for every loopback caller.
-	// The listener is 127.0.0.1, so this key is not a capability. The vault
-	// connect secret still authorizes the first connect. Callers must use
-	// this key; steroid and zsp keep the same constant.
-	localClientKey = "0000000000000000000000000000000000000000000000000000000000000002"
 )
 
-var errUnauthorized = errors.New("unauthorized")
+var (
+	errUnauthorized = errors.New("unauthorized")
+	errDenied       = errors.New("signature denied")
+)
+
+// Approver is called before each signature. A nil approver allows it.
+// Any error denies the signature.
+type Approver func(ctx context.Context, event gonostr.Event) error
 
 // Bunker serves one unlocked identity on loopback WebSockets.
+// The private key and connect secret live on separate locked pages and are
+// wiped when the bunker closes. Each bunker is a separate identity.
+// The connect secret stays valid for the life of the process, so every
+// program holding the bunker URL can connect. A restart loads the same secret
+// from the vault.
 type Bunker struct {
-	pubkey string
-	key    string
-	secret []byte
-	client string
-	opened bool
-	relays []string
-	url    string
-	wss    string
+	pubkey  string
+	key     *secretPage
+	connect *secretPage
+	callers map[string]struct{}
+	approve Approver
+	relays  []string
+	url     string
+	wss     string
 
 	mu      sync.Mutex
 	clients map[*client]struct{}
@@ -79,47 +83,66 @@ type relayPolicy struct {
 
 // Start serves NIP-46 on the provided loopback listeners.
 // secret is the Nostr private key. connect and token are the stable bunker
-// capability stored in the vault. The process keeps the key until exit.
-func Start(ctx context.Context, secret, connect [32]byte, token [16]byte, wsLn, wssLn net.Listener) (*Bunker, error) {
+// capability stored in the vault. secret is copied onto a locked page and the
+// caller's arrays should be wiped by the caller. approve may be nil.
+func Start(ctx context.Context, secret, connect [32]byte, token [16]byte, wsLn, wssLn net.Listener, approve Approver) (*Bunker, error) {
+	defer wipe32(&secret)
+	defer wipe32(&connect)
 	fail := func(err error) (*Bunker, error) {
 		_ = wsLn.Close()
 		_ = wssLn.Close()
 		return nil, err
 	}
-	hexKey := hex.EncodeToString(secret[:])
-	pubkey, err := gonostr.GetPublicKey(hexKey)
-	if err != nil {
-		return fail(fmt.Errorf("invalid Nostr private key: %w", err))
-	}
 	if connect == [32]byte{} || token == [16]byte{} {
 		return fail(errors.New("bunker secret is missing"))
 	}
-	cert, err := localCertificate()
+	pubkey, err := publicKeyHex(secret[:])
 	if err != nil {
 		return fail(err)
 	}
-	clientPub, err := gonostr.GetPublicKey(localClientKey)
+	keyPage, err := newSecretPage(secret)
 	if err != nil {
-		return fail(fmt.Errorf("local client key: %w", err))
+		return fail(err)
+	}
+	connectPage, err := newSecretPage(connect)
+	if err != nil {
+		keyPage.destroy()
+		return fail(err)
+	}
+	abandon := true
+	defer func() {
+		if abandon {
+			keyPage.destroy()
+			connectPage.destroy()
+			_ = wsLn.Close()
+			_ = wssLn.Close()
+		}
+	}()
+	cert, err := localCertificate()
+	if err != nil {
+		return nil, err
 	}
 	pathToken := hex.EncodeToString(token[:])
-	connectSecret := hex.EncodeToString(connect[:])
+	var connectHex [64]byte
+	hex.Encode(connectHex[:], connect[:])
+	defer clear(connectHex[:])
 	wsURL := relayURL("ws", wsLn.Addr(), pathToken)
 	wssURL := relayURL("wss", wssLn.Addr(), pathToken)
 	for _, relay := range []string{wsURL, wssURL} {
 		if err := LocalRelay(relay); err != nil {
-			return fail(err)
+			return nil, err
 		}
 	}
 	relays := []string{wsURL, wssURL}
 	b := &Bunker{
 		pubkey:  pubkey,
-		key:     hexKey,
-		secret:  []byte(connectSecret),
-		client:  clientPub,
+		key:     keyPage,
+		connect: connectPage,
+		callers: make(map[string]struct{}),
+		approve: approve,
 		relays:  relays,
-		url:     bunkerURL(pubkey, connectSecret, wsURL),
-		wss:     bunkerURL(pubkey, connectSecret, wssURL),
+		url:     bunkerURL(pubkey, string(connectHex[:]), wsURL),
+		wss:     bunkerURL(pubkey, string(connectHex[:]), wssURL),
 		clients: make(map[*client]struct{}),
 		exited:  make(chan struct{}),
 		errs:    make(chan error, 2),
@@ -130,6 +153,7 @@ func Start(ctx context.Context, secret, connect [32]byte, token [16]byte, wsLn, 
 		newServer(ctx, mux),
 		newServer(ctx, mux),
 	}
+	abandon = false
 	go serve(b, b.servers[0], wsLn)
 	go serve(b, b.servers[1], tls.NewListener(wssLn, &tls.Config{
 		Certificates: []tls.Certificate{cert},
@@ -172,6 +196,16 @@ func (b *Bunker) Close() {
 		for _, server := range b.servers {
 			_ = server.Shutdown(ctx)
 		}
+		b.mu.Lock()
+		if b.key != nil {
+			b.key.destroy()
+			b.key = nil
+		}
+		if b.connect != nil {
+			b.connect.destroy()
+			b.connect = nil
+		}
+		b.mu.Unlock()
 		close(b.exited)
 	})
 }
@@ -290,14 +324,24 @@ func (b *Bunker) accept(ctx context.Context, event gonostr.Event) (gonostr.Event
 	if err != nil || !valid {
 		return gonostr.Event{}, errors.New("invalid signature")
 	}
-	shared, err := nip04.ComputeSharedSecret(event.PubKey, b.key)
+	var shared []byte
+	var conversation [32]byte
+	err = b.useKey(func(key []byte) error {
+		var keyErr error
+		shared, keyErr = nip04Shared(event.PubKey, key)
+		if keyErr != nil {
+			return keyErr
+		}
+		conversation, keyErr = nip44Conversation(event.PubKey, key)
+		return keyErr
+	})
 	if err != nil {
+		clear(shared)
+		wipe32(&conversation)
 		return gonostr.Event{}, err
 	}
-	conversation, err := nip44.GenerateConversationKey(event.PubKey, b.key)
-	if err != nil {
-		return gonostr.Event{}, err
-	}
+	defer clear(shared)
+	defer wipe32(&conversation)
 	session := nip46.Session{
 		PublicKey:       b.pubkey,
 		SharedKey:       shared,
@@ -312,18 +356,25 @@ func (b *Bunker) accept(ctx context.Context, event gonostr.Event) (gonostr.Event
 	if err != nil {
 		return gonostr.Event{}, err
 	}
-	if err := response.Sign(b.key); err != nil {
+	if err := b.useKey(func(key []byte) error {
+		return signNostr(&response, key)
+	}); err != nil {
 		return gonostr.Event{}, err
 	}
 	return response, nil
 }
 
-func (b *Bunker) dispatch(_ context.Context, clientPub string, request nip46.Request) (string, error) {
+func (b *Bunker) dispatch(ctx context.Context, clientPub string, request nip46.Request) (string, error) {
 	b.mu.Lock()
-	defer b.mu.Unlock()
 	if err := b.authorize(clientPub, request); err != nil {
+		b.mu.Unlock()
 		return "", err
 	}
+	if request.Method == "sign_event" {
+		b.mu.Unlock()
+		return b.signRequested(ctx, request)
+	}
+	defer b.mu.Unlock()
 	switch request.Method {
 	case "connect", "logout":
 		return "ack", nil
@@ -341,34 +392,41 @@ func (b *Bunker) dispatch(_ context.Context, clientPub string, request nip46.Req
 			return "", err
 		}
 		return string(encoded), nil
-	case "sign_event":
-		return signEvent(b.pubkey, b.key, request)
 	default:
 		return "", fmt.Errorf("method %q is not allowed", request.Method)
 	}
 }
 
+// authorize runs while b.mu is held.
+// A caller that already presented the vault connect secret stays authorized
+// until logout. The secret is not consumed, so another program with the same
+// bunker URL can connect too.
 func (b *Bunker) authorize(clientPub string, request nip46.Request) error {
-	if subtle.ConstantTimeCompare([]byte(clientPub), []byte(b.client)) != 1 {
-		return errUnauthorized
-	}
-	if b.opened {
+	if _, ok := b.callers[clientPub]; ok {
+		if request.Method == "logout" {
+			delete(b.callers, clientPub)
+		}
 		return nil
 	}
 	if request.Method != "connect" || len(request.Params) < 2 || len(request.Params[1]) > 128 ||
-		request.Params[0] != b.pubkey ||
-		subtle.ConstantTimeCompare([]byte(request.Params[1]), b.secret) != 1 {
+		request.Params[0] != b.pubkey || !b.connectMatches(request.Params[1]) {
 		return errUnauthorized
 	}
-	b.opened = true
-	for i := range b.secret {
-		b.secret[i] = 0
-	}
-	b.secret = nil
+	b.callers[clientPub] = struct{}{}
 	return nil
 }
 
-func signEvent(pubkey, key string, request nip46.Request) (string, error) {
+func (b *Bunker) connectMatches(got string) bool {
+	if b.connect == nil || len(got) != hex.EncodedLen(32) {
+		return false
+	}
+	var want [64]byte
+	hex.Encode(want[:], b.connect.bytes())
+	defer clear(want[:])
+	return subtle.ConstantTimeCompare(want[:], []byte(got)) == 1
+}
+
+func (b *Bunker) signRequested(ctx context.Context, request nip46.Request) (string, error) {
 	if len(request.Params) != 1 {
 		return "", errors.New("sign_event requires one event")
 	}
@@ -377,15 +435,22 @@ func signEvent(pubkey, key string, request nip46.Request) (string, error) {
 		return "", errors.New("invalid event")
 	}
 	if event.PubKey == "" {
-		event.PubKey = pubkey
+		event.PubKey = b.pubkey
 	}
-	if event.PubKey != pubkey {
+	if event.PubKey != b.pubkey {
 		return "", errors.New("event pubkey does not match bunker")
 	}
 	if event.ID != "" && event.ID != event.GetID() {
 		return "", errors.New("event id does not match its body")
 	}
-	if err := event.Sign(key); err != nil {
+	if b.approve != nil {
+		if err := b.approve(ctx, event); err != nil || ctx.Err() != nil {
+			return "", errDenied
+		}
+	}
+	if err := b.useKey(func(key []byte) error {
+		return signNostr(&event, key)
+	}); err != nil {
 		return "", errors.New("sign event failed")
 	}
 	encoded, err := json.Marshal(event)
@@ -393,6 +458,15 @@ func signEvent(pubkey, key string, request nip46.Request) (string, error) {
 		return "", err
 	}
 	return string(encoded), nil
+}
+
+func (b *Bunker) useKey(fn func(key []byte) error) error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.key == nil {
+		return errors.New("bunker is closed")
+	}
+	return fn(b.key.bytes())
 }
 
 func (b *Bunker) publish(ctx context.Context, event gonostr.Event) {

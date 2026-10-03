@@ -1,11 +1,13 @@
 package bunker
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/tls"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"net"
 	"net/http"
 	"net/url"
@@ -39,7 +41,7 @@ func TestBunkerSignsOnLocalRelays(t *testing.T) {
 		t.Fatalf("url = %s", b.URL())
 	}
 
-	clientKey := localClientKey
+	clientKey := gonostr.GeneratePrivateKey()
 	client, err := nip46.ConnectBunker(ctx, clientKey, b.URL(), nil, func(string) {})
 	if err != nil {
 		t.Fatal(err)
@@ -82,10 +84,15 @@ func TestBunkerSignsOnLocalRelays(t *testing.T) {
 	}
 
 	other, err := nip46.ConnectBunker(ctx, gonostr.GeneratePrivateKey(), b.URL(), nil, func(string) {})
-	if err == nil {
-		t.Fatal("second client connected")
+	if err != nil {
+		t.Fatal(err)
 	}
-	_ = other
+	if _, err := other.GetPublicKey(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := nip46.ConnectBunker(ctx, gonostr.GeneratePrivateKey(), wrongSecret(t, b.URL()), nil, func(string) {}); err == nil {
+		t.Fatal("client connected without the vault secret")
+	}
 
 	again, err := nip46.ConnectBunker(ctx, clientKey, b.URL(), nil, func(string) {})
 	if err != nil {
@@ -149,6 +156,18 @@ func splitRelays(t *testing.T, wsBunker, wssBunker string) (ws, wss string) {
 	return ws, wss
 }
 
+func wrongSecret(t *testing.T, bunkerURL string) string {
+	t.Helper()
+	parsed, err := url.Parse(bunkerURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	query := parsed.Query()
+	query.Set("secret", hex.EncodeToString(bytes.Repeat([]byte{0xab}, 32)))
+	parsed.RawQuery = query.Encode()
+	return parsed.String()
+}
+
 func oneRelay(t *testing.T, bunkerURL, scheme string) string {
 	t.Helper()
 	parsed, err := url.Parse(bunkerURL)
@@ -162,6 +181,76 @@ func oneRelay(t *testing.T, bunkerURL, scheme string) string {
 	return relays[0]
 }
 
+func TestApproverDeniesSignature(t *testing.T) {
+	ctx, cancel := context.WithTimeout(t.Context(), 20*time.Second)
+	defer cancel()
+	secret := testKey(t)
+	var connect [32]byte
+	var token [16]byte
+	if _, err := rand.Read(connect[:]); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := rand.Read(token[:]); err != nil {
+		t.Fatal(err)
+	}
+	seen := make(chan gonostr.Event, 1)
+	b, err := Start(ctx, secret, connect, token, listen(t, "127.0.0.1:0"), listen(t, "127.0.0.1:0"), func(_ context.Context, event gonostr.Event) error {
+		seen <- event
+		return errors.New("no")
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer b.Close()
+	client, err := nip46.ConnectBunker(ctx, gonostr.GeneratePrivateKey(), b.URL(), nil, func(string) {})
+	if err != nil {
+		t.Fatal(err)
+	}
+	event := &gonostr.Event{Kind: 1, CreatedAt: gonostr.Now(), Content: "please", Tags: gonostr.Tags{}, PubKey: b.PublicKey()}
+	event.ID = event.GetID()
+	if err := client.SignEvent(ctx, event); err == nil || !strings.Contains(err.Error(), "signature denied") {
+		t.Fatalf("sign error = %v", err)
+	}
+	if event.Sig != "" {
+		t.Fatal("denied event was signed")
+	}
+	select {
+	case got := <-seen:
+		if got.Kind != 1 || got.Content != "please" {
+			t.Fatalf("prompt saw %+v", got)
+		}
+	case <-ctx.Done():
+		t.Fatal("approver was not called")
+	}
+}
+
+func TestBunkersUseSeparateKeys(t *testing.T) {
+	ctx, cancel := context.WithTimeout(t.Context(), 20*time.Second)
+	defer cancel()
+	a := start(t, ctx, testKey(t))
+	defer a.Close()
+	b := start(t, ctx, testKey(t))
+	defer b.Close()
+	if a.PublicKey() == b.PublicKey() || a.URL() == b.URL() {
+		t.Fatal("bunkers share an identity")
+	}
+	client, err := nip46.ConnectBunker(ctx, gonostr.GeneratePrivateKey(), a.URL(), nil, func(string) {})
+	if err != nil {
+		t.Fatal(err)
+	}
+	event := &gonostr.Event{Kind: 1, CreatedAt: gonostr.Now(), Content: "a", Tags: gonostr.Tags{}, PubKey: a.PublicKey()}
+	if err := client.SignEvent(ctx, event); err != nil {
+		t.Fatal(err)
+	}
+	if event.PubKey != a.PublicKey() || event.PubKey == b.PublicKey() {
+		t.Fatalf("signed as %s", event.PubKey)
+	}
+	valid, err := event.CheckSignature()
+	if err != nil || !valid {
+		t.Fatalf("signature valid=%v err=%v", valid, err)
+	}
+}
+
 func TestURLStableAcrossRestart(t *testing.T) {
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
@@ -173,7 +262,7 @@ func TestURLStableAcrossRestart(t *testing.T) {
 	wsLn := listen(t, "127.0.0.1:0")
 	wssLn := listen(t, "127.0.0.1:0")
 	wsAddr, wssAddr := wsLn.Addr().String(), wssLn.Addr().String()
-	first, err := Start(ctx, secret, connect, token, wsLn, wssLn)
+	first, err := Start(ctx, secret, connect, token, wsLn, wssLn, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -182,7 +271,7 @@ func TestURLStableAcrossRestart(t *testing.T) {
 	if err := first.Wait(); err != nil {
 		t.Fatal(err)
 	}
-	second, err := Start(ctx, secret, connect, token, listen(t, wsAddr), listen(t, wssAddr))
+	second, err := Start(ctx, secret, connect, token, listen(t, wsAddr), listen(t, wssAddr), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -202,7 +291,7 @@ func start(t *testing.T, ctx context.Context, secret [32]byte) *Bunker {
 	if _, err := rand.Read(token[:]); err != nil {
 		t.Fatal(err)
 	}
-	b, err := Start(ctx, secret, connect, token, listen(t, "127.0.0.1:0"), listen(t, "127.0.0.1:0"))
+	b, err := Start(ctx, secret, connect, token, listen(t, "127.0.0.1:0"), listen(t, "127.0.0.1:0"), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
