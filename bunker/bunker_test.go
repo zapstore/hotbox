@@ -8,10 +8,12 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -23,7 +25,9 @@ import (
 func TestBunkerSignsOnLocalRelays(t *testing.T) {
 	ctx, cancel := context.WithTimeout(t.Context(), 20*time.Second)
 	defer cancel()
-	b := start(t, ctx, testKey(t))
+	secret := testKey(t)
+	logged := &lockedBuffer{}
+	b := start(t, ctx, secret, slog.New(slog.NewTextHandler(logged, nil)))
 	defer b.Close()
 
 	ws, wss := splitRelays(t, b.URL(), b.WSS())
@@ -90,8 +94,14 @@ func TestBunkerSignsOnLocalRelays(t *testing.T) {
 	if _, err := other.GetPublicKey(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := nip46.ConnectBunker(ctx, gonostr.GeneratePrivateKey(), wrongSecret(t, b.URL()), nil, func(string) {}); err == nil {
-		t.Fatal("client connected without the vault secret")
+	wrong, err := nip46.ConnectBunker(ctx, gonostr.GeneratePrivateKey(), wrongSecret(t, b.URL()), nil, func(string) {})
+	if err != nil {
+		t.Fatal(err)
+	}
+	wrongEvent := &gonostr.Event{Kind: 1, CreatedAt: gonostr.Now(), Content: "anyway", Tags: gonostr.Tags{}, PubKey: pub}
+	wrongEvent.ID = wrongEvent.GetID()
+	if err := wrong.SignEvent(ctx, wrongEvent); err != nil {
+		t.Fatal(err)
 	}
 
 	again, err := nip46.ConnectBunker(ctx, clientKey, b.URL(), nil, func(string) {})
@@ -101,12 +111,59 @@ func TestBunkerSignsOnLocalRelays(t *testing.T) {
 	if _, err := again.GetPublicKey(ctx); err != nil {
 		t.Fatal(err)
 	}
+	text := logged.String()
+	if !strings.Contains(text, "msg=signature") || !strings.Contains(text, "result=signed") || !strings.Contains(text, "msg=connected") {
+		t.Fatalf("log = %s", text)
+	}
+	if strings.Contains(text, hex.EncodeToString(secret[:])) || strings.Contains(text, "bunker://") {
+		t.Fatal("log contains key material or the bunker URL")
+	}
+}
+
+func TestPlainEventIsLogged(t *testing.T) {
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+	logged := &lockedBuffer{}
+	b := start(t, ctx, testKey(t), slog.New(slog.NewTextHandler(logged, nil)))
+	defer b.Close()
+	ws, _ := splitRelays(t, b.URL(), b.WSS())
+	conn, _, err := websocket.Dial(ctx, ws, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close(websocket.StatusNormalClosure, "")
+	sk := gonostr.GeneratePrivateKey()
+	event := gonostr.Event{Kind: 1, CreatedAt: gonostr.Now(), Content: "secret-body", Tags: gonostr.Tags{}}
+	if err := event.Sign(sk); err != nil {
+		t.Fatal(err)
+	}
+	body, err := json.Marshal([]any{"EVENT", event})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := conn.Write(ctx, websocket.MessageText, body); err != nil {
+		t.Fatal(err)
+	}
+	_, message, err := conn.Read(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(message), "false") {
+		t.Fatalf("reply = %s", message)
+	}
+	text := logged.String()
+	if !strings.Contains(text, "msg=connection") || !strings.Contains(text, "msg=event") || !strings.Contains(text, "result=rejected") {
+		t.Fatalf("log = %s", text)
+	}
+	if strings.Contains(text, "secret-body") {
+		t.Fatal("log contains the event content")
+	}
 }
 
 func TestWSSHandshake(t *testing.T) {
 	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
 	defer cancel()
-	b := start(t, ctx, testKey(t))
+	b := start(t, ctx, testKey(t), nil)
 	defer b.Close()
 	_, wss := splitRelays(t, b.URL(), b.WSS())
 	conn, _, err := websocket.Dial(ctx, wss, &websocket.DialOptions{
@@ -135,7 +192,7 @@ func TestWSSHandshake(t *testing.T) {
 
 func TestShutdownOnCancel(t *testing.T) {
 	ctx, cancel := context.WithCancel(t.Context())
-	b := start(t, ctx, testKey(t))
+	b := start(t, ctx, testKey(t), nil)
 	cancel()
 	done := make(chan error, 1)
 	go func() { done <- b.Wait() }()
@@ -194,10 +251,11 @@ func TestApproverDeniesSignature(t *testing.T) {
 		t.Fatal(err)
 	}
 	seen := make(chan gonostr.Event, 1)
-	b, err := Start(ctx, secret, connect, token, listen(t, "127.0.0.1:0"), listen(t, "127.0.0.1:0"), func(_ context.Context, event gonostr.Event) error {
+	logged := &lockedBuffer{}
+	b, err := Start(ctx, keyFrom(secret), connect, token, listen(t, "127.0.0.1:0"), listen(t, "127.0.0.1:0"), func(_ context.Context, event gonostr.Event) error {
 		seen <- event
 		return errors.New("no")
-	})
+	}, slog.New(slog.NewTextHandler(logged, nil)))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -214,6 +272,13 @@ func TestApproverDeniesSignature(t *testing.T) {
 	if event.Sig != "" {
 		t.Fatal("denied event was signed")
 	}
+	text := logged.String()
+	if !strings.Contains(text, "msg=signature") || !strings.Contains(text, "result=denied") {
+		t.Fatalf("log = %s", text)
+	}
+	if strings.Contains(text, "please") || strings.Contains(text, hex.EncodeToString(secret[:])) {
+		t.Fatal("log contains the event content or the private key")
+	}
 	select {
 	case got := <-seen:
 		if got.Kind != 1 || got.Content != "please" {
@@ -227,9 +292,9 @@ func TestApproverDeniesSignature(t *testing.T) {
 func TestBunkersUseSeparateKeys(t *testing.T) {
 	ctx, cancel := context.WithTimeout(t.Context(), 20*time.Second)
 	defer cancel()
-	a := start(t, ctx, testKey(t))
+	a := start(t, ctx, testKey(t), nil)
 	defer a.Close()
-	b := start(t, ctx, testKey(t))
+	b := start(t, ctx, testKey(t), nil)
 	defer b.Close()
 	if a.PublicKey() == b.PublicKey() || a.URL() == b.URL() {
 		t.Fatal("bunkers share an identity")
@@ -262,7 +327,7 @@ func TestURLStableAcrossRestart(t *testing.T) {
 	wsLn := listen(t, "127.0.0.1:0")
 	wssLn := listen(t, "127.0.0.1:0")
 	wsAddr, wssAddr := wsLn.Addr().String(), wssLn.Addr().String()
-	first, err := Start(ctx, secret, connect, token, wsLn, wssLn, nil)
+	first, err := Start(ctx, keyFrom(secret), connect, token, wsLn, wssLn, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -271,7 +336,7 @@ func TestURLStableAcrossRestart(t *testing.T) {
 	if err := first.Wait(); err != nil {
 		t.Fatal(err)
 	}
-	second, err := Start(ctx, secret, connect, token, listen(t, wsAddr), listen(t, wssAddr), nil)
+	second, err := Start(ctx, keyFrom(secret), connect, token, listen(t, wsAddr), listen(t, wssAddr), nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -281,7 +346,7 @@ func TestURLStableAcrossRestart(t *testing.T) {
 	}
 }
 
-func start(t *testing.T, ctx context.Context, secret [32]byte) *Bunker {
+func start(t *testing.T, ctx context.Context, secret [32]byte, log *slog.Logger) *Bunker {
 	t.Helper()
 	var connect [32]byte
 	var token [16]byte
@@ -291,7 +356,7 @@ func start(t *testing.T, ctx context.Context, secret [32]byte) *Bunker {
 	if _, err := rand.Read(token[:]); err != nil {
 		t.Fatal(err)
 	}
-	b, err := Start(ctx, secret, connect, token, listen(t, "127.0.0.1:0"), listen(t, "127.0.0.1:0"), nil)
+	b, err := Start(ctx, keyFrom(secret), connect, token, listen(t, "127.0.0.1:0"), listen(t, "127.0.0.1:0"), nil, log)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -305,6 +370,43 @@ func listen(t *testing.T, addr string) net.Listener {
 		t.Fatal(err)
 	}
 	return ln
+}
+
+func TestStartRequiresKey(t *testing.T) {
+	var connect [32]byte
+	var token [16]byte
+	connect[0] = 1
+	token[0] = 2
+	_, err := Start(t.Context(), nil, connect, token, listen(t, "127.0.0.1:0"), listen(t, "127.0.0.1:0"), nil, nil)
+	if err == nil {
+		t.Fatal("accepted a nil key")
+	}
+}
+
+type lockedBuffer struct {
+	mu sync.Mutex
+	bytes.Buffer
+}
+
+func (b *lockedBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.Buffer.Write(p)
+}
+
+func (b *lockedBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.Buffer.String()
+}
+
+func keyFrom(secret [32]byte) KeyFunc {
+	return func(ctx context.Context, fn func(key []byte) error) error {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		return fn(secret[:])
+	}
 }
 
 func testKey(t *testing.T) [32]byte {

@@ -8,7 +8,7 @@ import (
 	"github.com/mattn/go-isatty"
 )
 
-// maxPasswordLine matches the vault package limit.
+// maxPasswordLine matches the vaultcore passphrase limit.
 const maxPasswordLine = 4 << 10
 
 func unlockPassword(label string) ([]byte, error) {

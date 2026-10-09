@@ -1,6 +1,6 @@
-/hotbox
 /dist/
 *.hotbox
 .agents/skills
 
-_ref/
+/go.work
+/go.work.sum

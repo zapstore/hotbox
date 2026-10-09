@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net"
 	"os"
 	"os/signal"
@@ -20,8 +21,9 @@ import (
 	"github.com/nbd-wtf/go-nostr/nip19"
 	"golang.org/x/sys/unix"
 
-	"github.com/zapstore/hotbox/internal/bunker"
-	"github.com/zapstore/hotbox/internal/vault"
+	"github.com/zapstore/hotbox/bunker"
+	"github.com/zapstore/hotbox/profile"
+	"vaultcore"
 )
 
 func main() {
@@ -32,22 +34,35 @@ func main() {
 }
 
 func run() error {
-	paths, help, err := parseArgs(os.Args[1:])
+	vaults, createKey, help, err := parseArgs(os.Args[1:])
 	if err != nil {
 		return err
 	}
 	if help {
 		fmt.Fprint(os.Stdout, `Usage:
-  hotbox
+  hotbox [--key file]
       Create a vault. Asks for a path, an nsec, and a password, prints the npub, then runs the bunker.
-  hotbox <vault.hotbox> [more.hotbox ...]
+  hotbox [--key file] <vault> [--key file] <vault> ...
       Unlock each vault and run a bunker for each.
+      A vault is a directory whose name ends in .hotbox. If you omit that suffix, it is added.
       A relative path is taken from the working directory. A leading ~/ is expanded.
 
-Creating a vault also writes a key file in the key directory: $HOTBOX_KEYS if
-set, otherwise `+defaultKeyDirHelp+`. Opening a vault needs
-its password and its key file. Neither the nsec nor the key file can be
-recovered from the vault; if one is lost, create a new vault from your nsec.
+The private key is stored at profiles/<name>/nsec and marked secret. Signing
+decrypts it only for the duration of the signature. Connect secret, token, and
+ports are stored at profiles/<name>/bunker.
+
+The key file defaults to <name>.key in $HOTBOX_KEYS, or `+defaultKeyDirHelp+` when that
+is unset. name is the vault name, so zapstore.hotbox uses zapstore.key.
+--key sets the file for the next vault only:
+
+  hotbox zapstore releases
+  hotbox --key /path/to/zapstore.key zapstore --key /path/to/releases.key releases
+
+Neither the nsec nor the key file can be recovered from the vault. If one is
+lost, create a new vault from your nsec.
+
+Connections and signature attempts are logged to stderr. The bunker URL and
+the private key are not logged.
 
 On a terminal, asks for each vault password. When stdin is not a terminal
 (a pipe, or a service that passes passwords on stdin), reads one line per
@@ -62,41 +77,73 @@ The bunker listens on 127.0.0.1 only, with ws and wss, and does not dial the net
 	if err := unix.Setrlimit(unix.RLIMIT_CORE, &unix.Rlimit{}); err != nil {
 		return fmt.Errorf("disable core dumps: %w", err)
 	}
+	log := slog.New(slog.NewTextHandler(os.Stderr, nil))
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	if len(paths) == 0 {
-		return createAndRun(ctx)
+	if len(vaults) == 0 {
+		err = createAndRun(ctx, log, createKey)
+	} else {
+		err = openAndRun(ctx, vaults, log)
 	}
-	return openAndRun(ctx, paths)
+	if err != nil {
+		log.Error("stopped", "err", err.Error())
+	} else {
+		log.Info("stopped")
+	}
+	return err
 }
 
-func parseArgs(args []string) (paths []string, help bool, err error) {
-	for _, arg := range args {
-		switch arg {
-		case "--help", "-h":
+// cliVault is one container argument. key is empty when the vault uses its default file.
+type cliVault struct {
+	arg string
+	key string
+}
+
+func parseArgs(args []string) (vaults []cliVault, createKey string, help bool, err error) {
+	var pending string
+	var haveKey bool
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		switch {
+		case arg == "--help" || arg == "-h":
 			help = true
-		case "help":
-			if len(args) == 1 {
-				help = true
-				continue
+		case arg == "help" && len(args) == 1:
+			help = true
+		case arg == "--key" && i+1 < len(args):
+			if haveKey {
+				return nil, "", false, errors.New("--key was given twice before a vault")
 			}
-			paths = append(paths, arg)
+			i++
+			pending = args[i]
+			haveKey = true
+		case arg == "--key":
+			return nil, "", false, errors.New("--key requires a file path")
+		case strings.HasPrefix(arg, "-"):
+			return nil, "", false, fmt.Errorf("unknown flag %s", arg)
 		default:
-			if strings.HasPrefix(arg, "-") {
-				return nil, false, fmt.Errorf("unknown flag %s", arg)
+			key := ""
+			if haveKey {
+				key = pending
+				haveKey = false
 			}
-			paths = append(paths, arg)
+			vaults = append(vaults, cliVault{arg: arg, key: key})
 		}
 	}
-	return paths, help, nil
+	if haveKey {
+		if len(vaults) == 0 {
+			return nil, pending, help, nil
+		}
+		return nil, "", false, errors.New("--key requires a vault")
+	}
+	return vaults, "", help, nil
 }
 
-func createAndRun(ctx context.Context) error {
-	raw, err := ask("Vault path", "Vault file. A relative path is taken from the working directory.", false, required)
+func createAndRun(ctx context.Context, log *slog.Logger, key string) error {
+	raw, err := ask("Vault path", "Directory name. .hotbox is added if you leave it off. A relative path is taken from the working directory.", false, required)
 	if err != nil {
 		return err
 	}
-	path, err := resolvePath(raw)
+	path, err := vaultPath(raw)
 	if err != nil {
 		return err
 	}
@@ -122,80 +169,78 @@ func createAndRun(ctx context.Context) error {
 		return err
 	}
 	defer clear(secret[:])
-	wsLn, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		return err
-	}
-	wssLn, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		_ = wsLn.Close()
-		return err
-	}
-	state := vault.State{Secret: secret}
-	defer state.Wipe()
-	if _, err := rand.Read(state.Connect[:]); err != nil {
-		_ = wsLn.Close()
-		_ = wssLn.Close()
-		return err
-	}
-	if _, err := rand.Read(state.Token[:]); err != nil {
-		_ = wsLn.Close()
-		_ = wssLn.Close()
-		return err
-	}
-	state.WSPort, err = tcpPort(wsLn)
-	if err != nil {
-		_ = wsLn.Close()
-		_ = wssLn.Close()
-		return err
-	}
-	state.WSSPort, err = tcpPort(wssLn)
-	if err != nil {
-		_ = wsLn.Close()
-		_ = wssLn.Close()
-		return err
-	}
-	keys, err := keyDir()
-	if err != nil {
-		_ = wsLn.Close()
-		_ = wssLn.Close()
-		return err
-	}
 	pw := []byte(password)
-	keyPath, err := vault.Create(path, keys, pw, state)
-	clear(pw)
-	if err != nil {
-		_ = wsLn.Close()
-		_ = wssLn.Close()
-		return err
-	}
-	npub, err := npubFromSecret(state.Secret)
-	if err != nil {
-		_ = wsLn.Close()
-		_ = wssLn.Close()
-		return err
-	}
-	fmt.Fprintf(os.Stderr, "created %s\nkey file %s (needed with the password to open the vault; not recoverable)\n[%s] %s\n", path, keyPath, label, npub)
-	started, err := bunker.Start(ctx, state.Secret, state.Connect, state.Token, wsLn, wssLn, nil)
-	state.Wipe()
-	clear(secret[:])
+	defer clear(pw)
+
+	wsLn, wssLn, err := listenPair()
 	if err != nil {
 		return err
 	}
-	return serve([]signer{{label: label, bunker: started}})
+	started := false
+	defer func() {
+		if !started {
+			_ = wsLn.Close()
+			_ = wssLn.Close()
+		}
+	}()
+	wsPort, err := tcpPort(wsLn)
+	if err != nil {
+		return err
+	}
+	wssPort, err := tcpPort(wssLn)
+	if err != nil {
+		return err
+	}
+	var connect [32]byte
+	var token [16]byte
+	defer func() {
+		connect = [32]byte{}
+		token = [16]byte{}
+		runtime.KeepAlive(&connect)
+		runtime.KeepAlive(&token)
+	}()
+	if _, err := rand.Read(connect[:]); err != nil {
+		return err
+	}
+	if _, err := rand.Read(token[:]); err != nil {
+		return err
+	}
+	keyFile, err := vaultKey(path, key)
+	if err != nil {
+		return err
+	}
+	v, prof, err := profile.Create(ctx, path, keyFile, label, pw, secret[:], connect, token, wsPort, wssPort)
+	if err != nil {
+		return err
+	}
+	defer v.Close()
+	running, err := bunker.Start(ctx, prof.Key, prof.Connect, prof.Token, wsLn, wssLn, nil, log)
+	npub := prof.Npub
+	keyFile = v.KeyFile()
+	prof.Wipe()
+	if err != nil {
+		return err
+	}
+	started = true
+	status("created %s", path)
+	status("key file %s", keyFile)
+	status("open with: hotbox --key %s %s", keyFile, path)
+	status("[%s] %s", label, npub)
+	return serve([]signer{{label: label, bunker: running}})
 }
 
 type vaultSpec struct {
 	path  string
 	label string
+	key   string
 }
 
-func openAndRun(ctx context.Context, arguments []string) error {
-	specs := make([]vaultSpec, 0, len(arguments))
-	seenPath := make(map[string]struct{}, len(arguments))
-	seenLabel := make(map[string]struct{}, len(arguments))
-	for _, argument := range arguments {
-		path, err := resolvePath(argument)
+func openAndRun(ctx context.Context, vaults []cliVault, log *slog.Logger) error {
+	specs := make([]vaultSpec, 0, len(vaults))
+	seenPath := make(map[string]struct{}, len(vaults))
+	seenLabel := make(map[string]struct{}, len(vaults))
+	for _, vault := range vaults {
+		path, err := vaultPath(vault.arg)
 		if err != nil {
 			return err
 		}
@@ -218,15 +263,17 @@ func openAndRun(ctx context.Context, arguments []string) error {
 			}
 			return err
 		}
-		if !info.Mode().IsRegular() {
-			return fmt.Errorf("vault %s is not a file", path)
+		if !info.IsDir() {
+			return fmt.Errorf("vault %s is not a directory container", path)
 		}
-		specs = append(specs, vaultSpec{path: path, label: label})
+		specs = append(specs, vaultSpec{path: path, label: label, key: vault.key})
 	}
-	keys, err := keyDir()
-	if err != nil {
-		return err
-	}
+	var opened []*vaultcore.Vault
+	defer func() {
+		for _, v := range opened {
+			_ = v.Close()
+		}
+	}()
 	running := make([]signer, 0, len(specs))
 	defer func() {
 		for _, s := range running {
@@ -239,34 +286,35 @@ func openAndRun(ctx context.Context, arguments []string) error {
 		if err != nil {
 			return err
 		}
-		state, err := vault.Open(spec.path, keys, password)
+		keyFile, err := vaultKey(spec.path, spec.key)
+		if err != nil {
+			return err
+		}
+		v, prof, err := profile.Open(ctx, spec.path, keyFile, password)
 		clear(password)
 		if err != nil {
 			return fmt.Errorf("%s: %w", spec.label, err)
 		}
-		if err := claimPorts(ports, spec.label, state.WSPort, state.WSSPort); err != nil {
-			state.Wipe()
+		opened = append(opened, v)
+		if err := claimPorts(ports, spec.label, prof.WSPort, prof.WSSPort); err != nil {
+			prof.Wipe()
 			return err
 		}
-		npub, err := npubFromSecret(state.Secret)
+		ws, wss, err := listenVault(prof.WSPort, prof.WSSPort)
 		if err != nil {
-			state.Wipe()
-			return err
-		}
-		ws, wss, err := listenVault(state)
-		if err != nil {
-			state.Wipe()
+			prof.Wipe()
 			return fmt.Errorf("%s: %w", spec.label, err)
 		}
-		started, err := bunker.Start(ctx, state.Secret, state.Connect, state.Token, ws, wss, nil)
-		state.Wipe()
+		started, err := bunker.Start(ctx, prof.Key, prof.Connect, prof.Token, ws, wss, nil, log)
+		npub := prof.Npub
+		prof.Wipe()
 		if err != nil {
 			return fmt.Errorf("%s: %w", spec.label, err)
 		}
 		running = append(running, signer{label: spec.label, npub: npub, bunker: started})
 	}
 	for _, s := range running {
-		fmt.Fprintf(os.Stderr, "hotbox: [%s] %s\n", s.label, s.npub)
+		status("hotbox: [%s] %s", s.label, s.npub)
 	}
 	return serve(running)
 }
@@ -286,7 +334,7 @@ func serve(running []signer) error {
 	for _, s := range running {
 		fmt.Printf("[%s] SIGN_WITH='%s'\n", s.label, s.bunker.URL())
 	}
-	fmt.Fprintln(os.Stderr, "local ws and wss only; interrupt to lock")
+	status("local ws and wss only; interrupt to lock")
 	if err := notifyReady(); err != nil {
 		return err
 	}
@@ -305,25 +353,55 @@ func serve(running []signer) error {
 	return errors.Join(errs...)
 }
 
-func listenVault(state vault.State) (net.Listener, net.Listener, error) {
-	wsLn, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", state.WSPort))
+func listenPair() (net.Listener, net.Listener, error) {
+	wsLn, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
-		return nil, nil, fmt.Errorf("listen on 127.0.0.1:%d: %w", state.WSPort, err)
+		return nil, nil, err
 	}
-	wssLn, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", state.WSSPort))
+	wssLn, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		_ = wsLn.Close()
-		return nil, nil, fmt.Errorf("listen on 127.0.0.1:%d: %w", state.WSSPort, err)
+		return nil, nil, err
+	}
+	return wsLn, wssLn, nil
+}
+
+func listenVault(ws, wss uint16) (net.Listener, net.Listener, error) {
+	wsLn, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", ws))
+	if err != nil {
+		return nil, nil, fmt.Errorf("listen on 127.0.0.1:%d: %w", ws, err)
+	}
+	wssLn, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", wss))
+	if err != nil {
+		_ = wsLn.Close()
+		return nil, nil, fmt.Errorf("listen on 127.0.0.1:%d: %w", wss, err)
 	}
 	return wsLn, wssLn, nil
 }
 
 const (
 	keyDirEnv         = "HOTBOX_KEYS"
-	defaultKeyDirHelp = "~/.local/share/hotbox"
+	defaultKeyDirHelp = "~/.keys/hotbox"
 )
 
-// keyDir is where vault key files live: $HOTBOX_KEYS, or ~/.local/share/hotbox.
+// vaultKey is the key file for a vault. An explicit path is used as given.
+// Otherwise the file is <name>.key in $HOTBOX_KEYS, or ~/.keys/hotbox.
+func vaultKey(vaultPath, explicit string) (string, error) {
+	if strings.TrimSpace(explicit) != "" {
+		return resolvePath(explicit)
+	}
+	dir, err := keyDir()
+	if err != nil {
+		return "", err
+	}
+	label, err := vaultLabel(vaultPath)
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(dir, label+".key"), nil
+}
+
+// keyDir is where default key files live: $HOTBOX_KEYS, or ~/.keys/hotbox.
 func keyDir() (string, error) {
 	if value := os.Getenv(keyDirEnv); strings.TrimSpace(value) != "" {
 		return resolvePath(value)
@@ -332,7 +410,19 @@ func keyDir() (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("find home directory: %w (set %s to a key directory)", err, keyDirEnv)
 	}
-	return filepath.Join(home, ".local", "share", "hotbox"), nil
+	return filepath.Join(home, ".keys", "hotbox"), nil
+}
+
+func vaultPath(argument string) (string, error) {
+	argument = strings.TrimSpace(argument)
+	argument = strings.TrimRight(argument, `/\`)
+	if argument == "" {
+		return "", errors.New("vault path is required")
+	}
+	if !strings.HasSuffix(argument, ".hotbox") {
+		argument += ".hotbox"
+	}
+	return resolvePath(argument)
 }
 
 func resolvePath(argument string) (string, error) {
@@ -351,19 +441,21 @@ func resolvePath(argument string) (string, error) {
 			argument = filepath.Join(home, argument[2:])
 		}
 	}
-	abs, err := filepath.Abs(argument)
-	if err != nil {
-		return "", err
-	}
-	return abs, nil
+	return filepath.Abs(argument)
 }
 
 func vaultLabel(path string) (string, error) {
-	label := strings.TrimSuffix(filepath.Base(path), ".hotbox")
+	label := filepath.Base(path)
+	for _, ext := range []string{".vault", ".hotbox"} {
+		if strings.HasSuffix(label, ext) {
+			label = strings.TrimSuffix(label, ext)
+			break
+		}
+	}
 	if label == "" || label == "." || label == string(filepath.Separator) {
 		return "", errors.New("vault path is invalid")
 	}
-	if strings.ContainsAny(label, "[]\r\n") {
+	if strings.ContainsAny(label, "[]\r\n/\\") {
 		return "", fmt.Errorf("vault name %q is invalid", label)
 	}
 	return label, nil
@@ -384,18 +476,6 @@ func claimPorts(used map[uint16]string, label string, ports ...uint16) error {
 		used[port] = label
 	}
 	return nil
-}
-
-func npubFromSecret(secret [32]byte) (string, error) {
-	pub, err := nostr.GetPublicKey(hex.EncodeToString(secret[:]))
-	if err != nil {
-		return "", err
-	}
-	npub, err := nip19.EncodePublicKey(pub)
-	if err != nil {
-		return "", err
-	}
-	return npub, nil
 }
 
 func secretFromInput(value string) ([32]byte, error) {
@@ -486,6 +566,10 @@ func strongPassword(value string) error {
 		return errors.New("use at least 12 characters")
 	}
 	return nil
+}
+
+func status(format string, args ...any) {
+	fmt.Fprintf(os.Stderr, format+"\n", args...)
 }
 
 func tcpPort(ln net.Listener) (uint16, error) {
