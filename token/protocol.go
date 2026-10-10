@@ -8,6 +8,7 @@
 //
 // info request body: u16 pin length, pin bytes.
 // sign request body: u16 pin length, pin, u32 mechanism, u32 data length, data.
+// proof request body: u16 pin length, pin, u64 created_at, u64 expiry.
 //
 // info response body, after status 0:
 //
@@ -20,6 +21,11 @@
 //	          u16 issuer, issuer, u16 serial, serial
 //
 // sign response body, after status 0: u32 signature length, signature.
+//
+// proof response body, after status 0: 32-byte Nostr public key,
+// 32-byte certificate SHA-256, u32 signature length, signature.
+// The signature is the NIP-C1 certificate signature over the proof message
+// for that public key: ASN.1 DER ECDSA or PKCS#1 v1.5, both with SHA-256.
 package token
 
 import (
@@ -32,6 +38,7 @@ const (
 	protoVersion = 1
 	opInfo       = 1
 	opSign       = 2
+	opProof      = 3
 
 	statusOK        = 0
 	statusPIN       = 1

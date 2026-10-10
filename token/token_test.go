@@ -12,6 +12,8 @@ import (
 	"encoding/binary"
 	"math/big"
 	"net"
+	"os"
+	"strings"
 	"testing"
 	"time"
 )
@@ -26,7 +28,7 @@ func TestSignOverSocket(t *testing.T) {
 	copy(pin[:], []byte("0123456789abcdef0123456789abcdef"))
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
-	tok, err := Start(ctx, Key{
+	tok, err := Start(ctx, t.Name(), Key{
 		Alias: "zapstore",
 		PIN:   pin,
 		Certs: [][]byte{der},
@@ -87,6 +89,73 @@ func TestSignOverSocket(t *testing.T) {
 	if !ecdsa.Verify(&key.PublicKey, sum[:], r, s) {
 		t.Fatal("signature did not verify")
 	}
+}
+
+func TestPaths(t *testing.T) {
+	sock, cfg, err := Paths("zapstore")
+	if err != nil {
+		t.Fatal(err)
+	}
+	again, againCfg, err := Paths("zapstore")
+	if err != nil || sock != again || cfg != againCfg {
+		t.Fatalf("paths changed: %s %s", sock, cfg)
+	}
+	if !strings.HasPrefix(sock, "/tmp/hotbox-") || !strings.HasSuffix(sock, "/zapstore.sock") || cfg != strings.TrimSuffix(sock, ".sock")+".pkcs11.cfg" {
+		t.Fatalf("socket %s config %s", sock, cfg)
+	}
+	if _, _, err := Paths(""); err == nil {
+		t.Fatal("accepted an empty name")
+	}
+	if _, _, err := Paths("../zapstore"); err == nil {
+		t.Fatal("accepted a parent path")
+	}
+}
+
+func TestSignerRestart(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	first := startSigner(t, ctx, t.Name())
+	if _, err := startSignerErr(t, ctx, t.Name()); err == nil {
+		t.Fatal("second signer started")
+	}
+	first.Close()
+	if err := os.WriteFile(first.Path, []byte("stale"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	second := startSigner(t, ctx, t.Name())
+	second.Close()
+	sock, _, err := Paths(t.Name())
+	if err != nil || first.Path != sock || second.Path != sock {
+		t.Fatalf("path %s then %s", first.Path, second.Path)
+	}
+}
+
+func startSigner(t *testing.T, ctx context.Context, name string) *Token {
+	t.Helper()
+	tok, err := startSignerErr(t, ctx, name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return tok
+}
+
+func startSignerErr(t *testing.T, ctx context.Context, name string) (*Token, error) {
+	t.Helper()
+	key, der := testCert(t)
+	pkcs8, err := x509.MarshalPKCS8PrivateKey(key)
+	if err != nil {
+		return nil, err
+	}
+	var pin [32]byte
+	copy(pin[:], []byte("0123456789abcdef0123456789abcdef"))
+	return Start(ctx, name, Key{
+		Alias: "hotbox",
+		PIN:   pin,
+		Certs: [][]byte{der},
+		Use: func(_ context.Context, fn func([]byte) error) error {
+			return fn(pkcs8)
+		},
+	}, "", nil)
 }
 
 func testCert(t *testing.T) (*ecdsa.PrivateKey, []byte) {

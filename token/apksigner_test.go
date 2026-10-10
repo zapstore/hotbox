@@ -59,7 +59,7 @@ func TestApksigner(t *testing.T) {
 	copy(pin[:], []byte("abcdef0123456789abcdef0123456789"))
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
-	tok, err := Start(ctx, Key{
+	tok, err := Start(ctx, t.Name(), Key{
 		Alias: "zapstore",
 		PIN:   pin,
 		Certs: [][]byte{der},

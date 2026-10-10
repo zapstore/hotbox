@@ -1,10 +1,10 @@
 // Package profile stores one bunker identity in a vaultcore container.
 //
-// The Nostr key is profiles/<name>/nsec and the Android key is
-// profiles/<name>/android-key. Both are marked secret, so the only read path
-// is Vault.Use. The connect secret, token, and ports are profiles/<name>/bunker.
-// The certificate chain and signing PIN are profiles/<name>/android.
-// Key and Android.Use decrypt a key only for the callback.
+// The Nostr key is profiles/<name>/nsec, marked secret, so the only read path
+// is Vault.Use. An Android key is optional. When present it is
+// profiles/<name>/android-key, also secret. The connect secret, token, and
+// ports are profiles/<name>/bunker. The certificate chain and signing PIN are
+// profiles/<name>/android. Key and Android.Use decrypt a key only for the callback.
 package profile
 
 import (
@@ -57,7 +57,8 @@ func (p *Profile) Wipe() {
 // Create seals a new directory container holding one profile and returns it open.
 // secret is the 32-byte Nostr private key. The caller wipes secret and password.
 // keyFile is the key path. It is empty when opts select the keychain or no key file.
-// android is sealed in the same call. There is no later way to add or replace it.
+// android is sealed in the same call when it is set. The zero value seals only
+// the nsec. There is no later way to add or replace an Android key.
 func Create(ctx context.Context, path, keyFile, name string, password, secret []byte, connect [32]byte, token [16]byte, wsPort, wssPort uint16, android AndroidKey, opts ...vaultcore.Option) (*vaultcore.Vault, Profile, error) {
 	if err := validName(name); err != nil {
 		return nil, Profile{}, err
@@ -68,8 +69,10 @@ func Create(ctx context.Context, path, keyFile, name string, password, secret []
 	if err := validSecret(secret); err != nil {
 		return nil, Profile{}, err
 	}
-	if err := validAndroid(android); err != nil {
-		return nil, Profile{}, err
+	if !androidOmitted(android) {
+		if err := validAndroid(android); err != nil {
+			return nil, Profile{}, err
+		}
 	}
 	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
 		return nil, Profile{}, err
@@ -92,16 +95,18 @@ func Create(ctx context.Context, path, keyFile, name string, password, secret []
 	if err := v.Add(ctx, bunkerPath(name), bytes.NewReader(body), false); err != nil {
 		return nil, Profile{}, err
 	}
-	meta, err := encodeAndroid(android)
-	if err != nil {
-		return nil, Profile{}, err
-	}
-	defer wipe(meta)
-	if err := v.Add(ctx, androidPath(name), bytes.NewReader(meta), false); err != nil {
-		return nil, Profile{}, err
-	}
-	if err := v.Add(ctx, androidKeyPath(name), bytes.NewReader(android.PKCS8), true); err != nil {
-		return nil, Profile{}, err
+	if !androidOmitted(android) {
+		meta, err := encodeAndroid(android)
+		if err != nil {
+			return nil, Profile{}, err
+		}
+		defer wipe(meta)
+		if err := v.Add(ctx, androidPath(name), bytes.NewReader(meta), false); err != nil {
+			return nil, Profile{}, err
+		}
+		if err := v.Add(ctx, androidKeyPath(name), bytes.NewReader(android.PKCS8), true); err != nil {
+			return nil, Profile{}, err
+		}
 	}
 	p, err := load(ctx, v, name)
 	if err != nil {
@@ -163,7 +168,9 @@ func load(ctx context.Context, v *vaultcore.Vault, name string) (Profile, error)
 			defer gate.Unlock()
 			return v.Use(ctx, nsecPath(name), fn)
 		},
-		Android: Android{
+	}
+	if certs != nil {
+		p.Android = Android{
 			Alias: alias,
 			PIN:   pin,
 			Certs: certs,
@@ -172,7 +179,7 @@ func load(ctx context.Context, v *vaultcore.Vault, name string) (Profile, error)
 				defer gate.Unlock()
 				return v.Use(ctx, androidKeyPath(name), fn)
 			},
-		},
+		}
 	}
 	if err := p.Key(ctx, func(key []byte) error {
 		pub, err := pubkey(key)
@@ -196,7 +203,7 @@ func confirmSecret(v *vaultcore.Vault, name string) error {
 	if err != nil {
 		return err
 	}
-	var nsec, key, meta bool
+	var nsec, hasKey, keySecret, hasMeta, metaSecret bool
 	for _, e := range entries {
 		if e.Dir {
 			continue
@@ -205,15 +212,17 @@ func confirmSecret(v *vaultcore.Vault, name string) error {
 		case "nsec":
 			nsec = e.Secret
 		case "android-key":
-			key = e.Secret
+			hasKey = true
+			keySecret = e.Secret
 		case "android":
-			meta = !e.Secret
+			hasMeta = true
+			metaSecret = e.Secret
 		}
 	}
 	if !nsec {
 		return errors.New("nsec entry is missing or not secret")
 	}
-	if !key || !meta {
+	if hasKey != hasMeta || (hasKey && (!keySecret || metaSecret)) {
 		return errors.New("android signing key is missing or not secret")
 	}
 	return nil
@@ -293,7 +302,7 @@ func readAndroid(ctx context.Context, v *vaultcore.Vault, name string) (alias st
 	w.max = maxAndroidMeta
 	if err = v.Cat(ctx, androidPath(name), &w); err != nil {
 		if errors.Is(err, vaultcore.ErrNotFound) {
-			err = errors.New("android signing key is missing or not secret")
+			err = nil
 		}
 		return
 	}

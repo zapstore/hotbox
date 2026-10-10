@@ -7,8 +7,6 @@ import (
 	"crypto/x509"
 	"encoding/binary"
 	"errors"
-	"fmt"
-	"strings"
 )
 
 const (
@@ -16,9 +14,12 @@ const (
 	maxCerts       = 8
 	maxCertDER     = 16 << 10
 	maxAndroidMeta = 256 << 10
+	// AndroidAlias is the PKCS#11 label of the sealed key. Every vault uses it.
+	AndroidAlias = "hotbox"
 )
 
 // AndroidKey is the signing material sealed at vault creation.
+// The zero value means the vault has no Android key.
 // PIN is 32 hex characters. PKCS8 is PrivateKeyInfo DER. Certs is leaf first.
 // The caller wipes PKCS8.
 type AndroidKey struct {
@@ -44,9 +45,13 @@ func (a *Android) Wipe() {
 	a.PIN = [32]byte{}
 }
 
+func androidOmitted(a AndroidKey) bool {
+	return a.Alias == "" && a.PIN == [32]byte{} && len(a.PKCS8) == 0 && len(a.Certs) == 0
+}
+
 func validAndroid(a AndroidKey) error {
-	if err := validAlias(a.Alias); err != nil {
-		return err
+	if a.Alias != AndroidAlias {
+		return errors.New("android alias is invalid")
 	}
 	for _, c := range a.PIN {
 		if !isHex(c) {
@@ -94,13 +99,6 @@ func pubEqual(key any, pub any) bool {
 	default:
 		return false
 	}
-}
-
-func validAlias(alias string) error {
-	if alias == "" || len(alias) > 128 || strings.ContainsAny(alias, "'\"\r\n\\") {
-		return fmt.Errorf("android alias %q is invalid", alias)
-	}
-	return nil
 }
 
 func isHex(c byte) bool {
@@ -152,7 +150,7 @@ func decodeAndroid(buf []byte) (alias string, pin [32]byte, certs [][]byte, err 
 	}
 	alias = string(buf[:aliasLen])
 	buf = buf[aliasLen:]
-	if err = validAlias(alias); err != nil {
+	if alias != AndroidAlias {
 		err = errCorrupt
 		return
 	}

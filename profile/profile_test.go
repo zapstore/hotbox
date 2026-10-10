@@ -205,6 +205,51 @@ func TestRejectsExtraProfileAndFile(t *testing.T) {
 	}
 }
 
+func TestCreateNoAndroid(t *testing.T) {
+	ctx := t.Context()
+	secret := testSecret(t)
+	dir := t.TempDir()
+	path := filepath.Join(dir, "zapstore.vault")
+	keys := filepath.Join(dir, "zapstore.key")
+	var connect [32]byte
+	var token [16]byte
+	connect[0] = 5
+	token[0] = 6
+	v, prof, err := profile.Create(ctx, path, keys, "zapstore", []byte("correct horse battery"), secret, connect, token, 10001, 10002, profile.AndroidKey{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if prof.Android.Use != nil || prof.Npub == "" {
+		t.Fatalf("android=%v npub=%s", prof.Android.Use != nil, prof.Npub)
+	}
+	var buf bytes.Buffer
+	if err := v.Cat(ctx, "profiles/zapstore/android", &buf); !errors.Is(err, vaultcore.ErrNotFound) {
+		t.Fatalf("android entry: %v", err)
+	}
+	if err := v.Cat(ctx, "profiles/zapstore/android-key", &buf); !errors.Is(err, vaultcore.ErrNotFound) {
+		t.Fatalf("android key: %v", err)
+	}
+	dest := t.TempDir()
+	res, err := v.Export(ctx, dest, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Skipped != 1 || res.Files != 1 {
+		t.Fatalf("export files=%d skipped=%d", res.Files, res.Skipped)
+	}
+	if err := v.Close(); err != nil {
+		t.Fatal(err)
+	}
+	again, opened, err := profile.Open(ctx, path, keys, []byte("correct horse battery"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer again.Close()
+	if opened.Android.Use != nil || opened.Npub != prof.Npub {
+		t.Fatalf("reopen android=%v npub=%s", opened.Android.Use != nil, opened.Npub)
+	}
+}
+
 func TestCreateNoKeyFile(t *testing.T) {
 	ctx := t.Context()
 	secret := testSecret(t)
@@ -283,7 +328,7 @@ func testAndroid(t *testing.T) profile.AndroidKey {
 	}
 	var pin [32]byte
 	copy(pin[:], []byte("0123456789abcdef0123456789abcdef"))
-	return profile.AndroidKey{Alias: "zapstore", PIN: pin, PKCS8: pkcs8, Certs: [][]byte{der}}
+	return profile.AndroidKey{Alias: profile.AndroidAlias, PIN: pin, PKCS8: pkcs8, Certs: [][]byte{der}}
 }
 
 func testSecret(t *testing.T) []byte {

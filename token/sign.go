@@ -11,8 +11,10 @@ import (
 	"crypto/x509"
 	"encoding/asn1"
 	"errors"
+	"fmt"
 	"hash"
 	"math/big"
+	"time"
 )
 
 const (
@@ -31,6 +33,49 @@ const (
 )
 
 var errMechanism = errors.New("mechanism rejected")
+
+const (
+	// proofSkew is how far a proof's created_at may be from this clock.
+	proofSkew = 5 * time.Minute
+	// proofMaxLife bounds a proof's validity. It matches the zsp default plus a day.
+	proofMaxLife = (2*365 + 1) * 24 * time.Hour
+)
+
+// proofMessage is the NIP-C1 certificate-signed message.
+func proofMessage(createdAt, expiry int64, pubkey string) []byte {
+	return []byte(fmt.Sprintf("Verifying at %d until %d that I control the following Nostr public key: %s", createdAt, expiry, pubkey))
+}
+
+func proofWindow(createdAt, expiry int64, now time.Time) error {
+	if d := now.Sub(time.Unix(createdAt, 0)); d > proofSkew || d < -proofSkew {
+		return errors.New("proof created_at is not near the current time")
+	}
+	if expiry <= createdAt {
+		return errors.New("proof expiry is not after created_at")
+	}
+	if time.Duration(expiry-createdAt)*time.Second > proofMaxLife {
+		return errors.New("proof expiry is more than two years away")
+	}
+	return nil
+}
+
+// signProof signs a NIP-C1 message: ECDSA with SHA-256 as ASN.1 DER, or
+// RSASSA-PKCS1-v1_5 with SHA-256.
+func signProof(pkcs8, message []byte) ([]byte, error) {
+	key, err := x509.ParsePKCS8PrivateKey(pkcs8)
+	if err != nil {
+		return nil, err
+	}
+	sum := sha256.Sum256(message)
+	switch k := key.(type) {
+	case *rsa.PrivateKey:
+		return rsa.SignPKCS1v15(rand.Reader, k, crypto.SHA256, sum[:])
+	case *ecdsa.PrivateKey:
+		return ecdsa.SignASN1(rand.Reader, k, sum[:])
+	default:
+		return nil, errMechanism
+	}
+}
 
 func signPKCS8(pkcs8 []byte, mechanism uint32, data []byte) ([]byte, error) {
 	key, err := x509.ParsePKCS8PrivateKey(pkcs8)

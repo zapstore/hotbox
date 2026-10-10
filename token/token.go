@@ -4,7 +4,7 @@ package token
 
 import (
 	"context"
-	"crypto/rand"
+	"crypto/sha256"
 	"crypto/subtle"
 	"crypto/x509"
 	"encoding/binary"
@@ -17,32 +17,38 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
+
+	"golang.org/x/sys/unix"
 )
 
 // Key is the unlocked signing material. Use decrypts the PKCS#8 key for the
-// callback. PIN is 32 hex characters. Certs is leaf first.
+// callback. PIN is 32 hex characters. Certs is leaf first. Pubkey is the
+// vault's hex Nostr public key; NIP-C1 proofs are signed only for it.
 type Key struct {
-	Alias string
-	PIN   [32]byte
-	Certs [][]byte
-	Use   func(context.Context, func([]byte) error) error
+	Alias  string
+	PIN    [32]byte
+	Certs  [][]byte
+	Pubkey string
+	Use    func(context.Context, func([]byte) error) error
 }
 
-// Token is one listening signer. Path, Config, Alias, and Pin are printed
-// for apksigner. Pin is empty when the token is closed.
+// Token is one listening signer. Path and Config are derived from the vault
+// name. Pin is empty when the token is closed.
 type Token struct {
 	Alias  string
 	Path   string
 	Config string
 
-	pin   [32]byte
-	certs []certInfo
-	use   func(context.Context, func([]byte) error) error
-	log   *slog.Logger
-	ctx   context.Context
+	pin    [32]byte
+	certs  []certInfo
+	pubkey [32]byte
+	use    func(context.Context, func([]byte) error) error
+	log    *slog.Logger
+	ctx    context.Context
 
 	ln   net.Listener
 	sem  chan struct{}
@@ -57,9 +63,26 @@ type certInfo struct {
 	serial  []byte
 }
 
-// Start listens on a socket under /tmp/hotbox-<uid>. lib is the PKCS#11
-// module path. An empty lib still serves the socket and leaves Config empty.
-func Start(ctx context.Context, key Key, lib string, log *slog.Logger) (*Token, error) {
+// Paths is the Unix socket and the SunPKCS11 config for a vault name.
+// Both are /tmp/hotbox-<uid>/<name>.sock and .pkcs11.cfg, and they stay
+// the same for this user and name across restarts.
+func Paths(name string) (socket, config string, err error) {
+	if name == "" || name == "." || name == ".." || strings.ContainsAny(name, "/\\\x00[]\r\n") || filepath.Base(name) != name {
+		return "", "", fmt.Errorf("vault name %q is invalid", name)
+	}
+	dir := fmt.Sprintf("/tmp/hotbox-%d", os.Getuid())
+	socket = filepath.Join(dir, name+".sock")
+	config = filepath.Join(dir, name+".pkcs11.cfg")
+	// Darwin's sun_path holds 104 bytes, including the trailing NUL.
+	if len(socket) >= 104 || len(config) >= 104 {
+		return "", "", fmt.Errorf("vault name %q is too long", name)
+	}
+	return socket, config, nil
+}
+
+// Start listens on the socket from Paths. lib is the PKCS#11 module path.
+// An empty lib still serves the socket and leaves Config empty.
+func Start(ctx context.Context, name string, key Key, lib string, log *slog.Logger) (*Token, error) {
 	if key.Use == nil {
 		return nil, errors.New("android signer is missing")
 	}
@@ -72,6 +95,14 @@ func Start(ctx context.Context, key Key, lib string, log *slog.Logger) (*Token, 
 	}
 	if _, _, _, err := publicFields(leaf); err != nil {
 		return nil, err
+	}
+	var pubkey [32]byte
+	if key.Pubkey != "" {
+		raw, err := hex.DecodeString(key.Pubkey)
+		if err != nil || len(raw) != len(pubkey) || hex.EncodeToString(raw) != key.Pubkey {
+			return nil, errors.New("nostr public key is invalid")
+		}
+		copy(pubkey[:], raw)
 	}
 	certs := make([]certInfo, len(key.Certs))
 	for i, der := range key.Certs {
@@ -86,28 +117,20 @@ func Start(ctx context.Context, key Key, lib string, log *slog.Logger) (*Token, 
 			serial:  c.SerialNumber.Bytes(),
 		}
 	}
-	dir, err := socketDir()
+	path, cfgPath, err := Paths(name)
 	if err != nil {
 		return nil, err
 	}
-	var id [8]byte
-	if _, err := rand.Read(id[:]); err != nil {
+	if _, err := socketDir(); err != nil {
 		return nil, err
 	}
-	name := hex.EncodeToString(id[:])
-	path := filepath.Join(dir, name+".sock")
-	ln, err := net.Listen("unix", path)
+	ln, err := listenUnix(name, path)
 	if err != nil {
-		return nil, err
-	}
-	if err := os.Chmod(path, 0600); err != nil {
-		_ = ln.Close()
-		_ = os.Remove(path)
 		return nil, err
 	}
 	cfg := ""
 	if lib != "" {
-		cfg = filepath.Join(dir, name+".pkcs11.cfg")
+		cfg = cfgPath
 		text := "name = Hotbox\nlibrary = " + lib + "\nslotListIndex = 0\n"
 		if err := os.WriteFile(cfg, []byte(text), 0600); err != nil {
 			_ = ln.Close()
@@ -121,6 +144,7 @@ func Start(ctx context.Context, key Key, lib string, log *slog.Logger) (*Token, 
 		Config: cfg,
 		pin:    key.PIN,
 		certs:  certs,
+		pubkey: pubkey,
 		use:    key.Use,
 		log:    log,
 		ctx:    ctx,
@@ -206,6 +230,8 @@ func (t *Token) handle(conn net.Conn) {
 		t.serveInfo(conn, body)
 	case opSign:
 		t.serveSign(conn, body)
+	case opProof:
+		t.serveProof(conn, body)
 	default:
 		_ = writeFrame(conn, statusBad, nil)
 	}
@@ -267,6 +293,48 @@ func (t *Token) serveSign(conn net.Conn, body []byte) {
 	binary.BigEndian.PutUint32(out[:4], uint32(len(sig)))
 	copy(out[4:], sig)
 	t.info("android signature", "alias", t.Alias, "mechanism", mechanismName(mech), "bytes", len(data))
+	_ = writeFrame(conn, statusOK, out)
+}
+
+func (t *Token) serveProof(conn net.Conn, body []byte) {
+	pin, rest, err := takePin(body)
+	if err != nil || !t.pinOK(pin) {
+		t.warn("android proof", "alias", t.Alias, "result", "denied")
+		_ = writeFrame(conn, statusPIN, nil)
+		return
+	}
+	if len(rest) != 16 || t.pubkey == [32]byte{} {
+		_ = writeFrame(conn, statusBad, nil)
+		return
+	}
+	createdAt := int64(binary.BigEndian.Uint64(rest[:8]))
+	expiry := int64(binary.BigEndian.Uint64(rest[8:16]))
+	if err := proofWindow(createdAt, expiry, time.Now()); err != nil {
+		t.warn("android proof", "alias", t.Alias, "result", "rejected", "err", err.Error())
+		_ = writeFrame(conn, statusBad, nil)
+		return
+	}
+	message := proofMessage(createdAt, expiry, hex.EncodeToString(t.pubkey[:]))
+	var sig []byte
+	err = t.use(t.ctx, func(pkcs8 []byte) error {
+		key := append([]byte(nil), pkcs8...)
+		defer wipe(key)
+		var signErr error
+		sig, signErr = signProof(key, message)
+		return signErr
+	})
+	if err != nil {
+		t.warn("android proof", "alias", t.Alias, "result", "rejected", "err", err.Error())
+		_ = writeFrame(conn, statusFailed, nil)
+		return
+	}
+	certHash := sha256.Sum256(t.certs[0].der)
+	out := make([]byte, 0, 32+32+4+len(sig))
+	out = append(out, t.pubkey[:]...)
+	out = append(out, certHash[:]...)
+	out = binary.BigEndian.AppendUint32(out, uint32(len(sig)))
+	out = append(out, sig...)
+	t.info("android proof", "alias", t.Alias, "expiry", time.Unix(expiry, 0).UTC().Format(time.DateOnly))
 	_ = writeFrame(conn, statusOK, out)
 }
 
@@ -333,6 +401,34 @@ func (t *Token) warn(msg string, args ...any) {
 	if t != nil && t.log != nil {
 		t.log.Warn(msg, args...)
 	}
+}
+
+func listenUnix(name, path string) (net.Listener, error) {
+	lockPath := strings.TrimSuffix(path, ".sock") + ".lock"
+	f, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0600)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	if err := unix.Flock(int(f.Fd()), unix.LOCK_EX); err != nil {
+		return nil, err
+	}
+	defer unix.Flock(int(f.Fd()), unix.LOCK_UN)
+	if conn, err := net.Dial("unix", path); err == nil {
+		_ = conn.Close()
+		return nil, fmt.Errorf("android signer %s is already running", name)
+	}
+	_ = os.Remove(path)
+	ln, err := net.Listen("unix", path)
+	if err != nil {
+		return nil, err
+	}
+	if err := os.Chmod(path, 0600); err != nil {
+		_ = ln.Close()
+		_ = os.Remove(path)
+		return nil, err
+	}
+	return ln, nil
 }
 
 func socketDir() (string, error) {

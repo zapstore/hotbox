@@ -39,6 +39,9 @@ func main() {
 }
 
 func run() error {
+	if len(os.Args) > 1 && os.Args[1] == "sign" {
+		return runSign(os.Args[2:])
+	}
 	vaults, createKey, help, err := parseArgs(os.Args[1:])
 	if err != nil {
 		return err
@@ -46,18 +49,22 @@ func run() error {
 	if help {
 		fmt.Fprint(os.Stdout, `Usage:
   hotbox [--key file]
-      Create a vault. Asks for a path, where to keep the key, an nsec, a password, and an Android keystore, prints the npub, then runs the bunker.
+      Create a vault. Asks for a path, where to keep the key, an nsec, a password, and an optional Android keystore, prints the npub, then runs the bunker.
   hotbox [--key file] <vault> [--key file] <vault> ...
       Unlock each vault and run a bunker for each.
       A vault is a directory whose name ends in .hotbox. If you omit that suffix, it is added.
       A relative path is taken from the working directory. A leading ~/ is expanded.
+      A vault named sign must be given as ./sign.
+  hotbox sign <app-unsigned.apk>...
+      Sign APKs with a running hotbox. See hotbox sign --help.
 
-The Nostr key is stored at profiles/<name>/nsec and marked secret. The Android
-private key is stored at profiles/<name>/android-key and marked secret. Each
-signature decrypts a key only for that call. The keystore is read once, at
-creation; there is no command to add or replace it. Connect secret, token, and
-ports are stored at profiles/<name>/bunker. The certificate chain and signing
-PIN are stored at profiles/<name>/android.
+The Nostr key is stored at profiles/<name>/nsec and marked secret. An Android
+keystore is optional. When one is given, the private key is stored at
+profiles/<name>/android-key and marked secret. Each signature decrypts a key
+only for that call. The keystore is read once, at creation; there is no
+command to add or replace it. Connect secret, token, and ports are stored at
+profiles/<name>/bunker. The certificate chain and signing PIN are stored at
+profiles/<name>/android.
 
 Creation asks for the macOS keychain, a key file, or the passphrase alone.
 The keychain is preselected when this machine has one. A key file defaults
@@ -80,9 +87,12 @@ the private key are not logged.
 On a terminal, asks for each vault password. When stdin is not a terminal
 (a pipe, or a service that passes passwords on stdin), reads one line per
 vault, in the same order as the paths.
-Prints [name] SIGN_WITH='bunker://…' for each vault, then ANDROID_ALIAS,
-HOTBOX_TOKEN, HOTBOX_PIN, and HOTBOX_PKCS11. apksigner uses those to sign.
+Prints a .env block for each vault: SIGN_WITH, and for a vault with an Android
+key also HOTBOX_SOCKET and HOTBOX_PIN. Paste it into the project .env as is.
+The socket and the PKCS#11 config are /tmp/hotbox-<uid>/<name>.sock and
+.pkcs11.cfg, and they stay the same across runs. The key alias is always hotbox.
 The PKCS#11 module asks hotbox to sign and never receives the private key.
+The socket also signs NIP-C1 certificate proofs, only for the vault's npub.
 Under systemd Type=notify, signals ready after every vault is listening.
 
 The bunker listens on 127.0.0.1 only, with ws and wss, and does not dial the network.
@@ -363,6 +373,18 @@ func openAndRun(ctx context.Context, vaults []cliVault, log *slog.Logger) error 
 	return serve(running)
 }
 
+// envBlock is the .env text for one vault. It is printed once, to stdout.
+func envBlock(label, signWith string, tok *token.Token) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "\n# %s: paste into the project .env, then chmod 600 .env and keep it out of git\n", label)
+	if tok != nil {
+		fmt.Fprintf(&b, "HOTBOX_SOCKET='%s'\n", tok.Path)
+		fmt.Fprintf(&b, "HOTBOX_PIN='%s'\n", tok.Pin())
+	}
+	fmt.Fprintf(&b, "SIGN_WITH='%s'\n\n", signWith)
+	return b.String()
+}
+
 type signer struct {
 	label  string
 	npub   string
@@ -378,13 +400,8 @@ func serve(running []signer) error {
 		}
 	}()
 	for _, s := range running {
-		fmt.Printf("[%s] SIGN_WITH='%s'\n", s.label, s.bunker.URL())
-		fmt.Printf("[%s] ANDROID_ALIAS='%s'\n", s.label, s.token.Alias)
-		fmt.Printf("[%s] HOTBOX_TOKEN='%s'\n", s.label, s.token.Path)
-		fmt.Printf("[%s] HOTBOX_PIN='%s'\n", s.label, s.token.Pin())
-		if s.token.Config != "" {
-			fmt.Printf("[%s] HOTBOX_PKCS11='%s'\n", s.label, s.token.Config)
-		} else {
+		fmt.Print(envBlock(s.label, s.bunker.URL(), s.token))
+		if s.token != nil && s.token.Config == "" {
 			status("pkcs11 module is not next to the hotbox binary; rebuild with make")
 		}
 	}
@@ -408,18 +425,30 @@ func serve(running []signer) error {
 }
 
 func startToken(ctx context.Context, prof profile.Profile, log *slog.Logger) (*token.Token, error) {
-	return token.Start(ctx, token.Key{
-		Alias: prof.Android.Alias,
-		PIN:   prof.Android.PIN,
-		Certs: prof.Android.Certs,
-		Use:   prof.Android.Use,
+	if prof.Android.Use == nil {
+		return nil, nil
+	}
+	prefix, decoded, err := nip19.Decode(prof.Npub)
+	pubkey, ok := decoded.(string)
+	if err != nil || prefix != "npub" || !ok {
+		return nil, errors.New("profile npub is invalid")
+	}
+	return token.Start(ctx, prof.Name, token.Key{
+		Alias:  prof.Android.Alias,
+		PIN:    prof.Android.PIN,
+		Certs:  prof.Android.Certs,
+		Pubkey: pubkey,
+		Use:    prof.Android.Use,
 	}, token.LibraryPath(), log)
 }
 
 func readAndroidKey() (profile.AndroidKey, error) {
-	raw, err := ask("Android keystore", "JKS, PKCS#12, or unencrypted PEM. Sealed into the vault; the file is not kept.", false, required)
+	raw, err := ask("Android keystore", "Optional. Leave empty to seal only the nsec. Otherwise JKS, PKCS#12, or unencrypted PEM. The file is not kept.", false, allowEmpty)
 	if err != nil {
 		return profile.AndroidKey{}, err
+	}
+	if strings.TrimSpace(raw) == "" {
+		return profile.AndroidKey{}, nil
 	}
 	path, err := resolvePath(raw)
 	if err != nil {
@@ -502,7 +531,7 @@ func readAndroidKey() (profile.AndroidKey, error) {
 	}
 	var pin [32]byte
 	hex.Encode(pin[:], seed[:])
-	return profile.AndroidKey{Alias: chosen.Alias, PIN: pin, PKCS8: chosen.PKCS8, Certs: chosen.Certs}, nil
+	return profile.AndroidKey{Alias: profile.AndroidAlias, PIN: pin, PKCS8: chosen.PKCS8, Certs: chosen.Certs}, nil
 }
 
 func askAlias(entries []keystore.Entry) (string, error) {
@@ -516,7 +545,7 @@ func askAlias(entries []keystore.Entry) (string, error) {
 	choice := entries[0].Alias
 	err := huh.NewSelect[string]().
 		Title("Key alias").
-		Description("This alias is sealed into the vault.").
+		Description("Which key to seal. Signing always uses the name hotbox.").
 		Options(opts...).
 		Value(&choice).
 		Run()
