@@ -1,22 +1,24 @@
 # hotbox
 
-Loopback NIP-46 bunker. It unlocks a vault and signs for clients such as zsp. It does not dial the network, and it does not sign APKs.
+Loopback NIP-46 bunker. It unlocks a vault and signs for clients such as zsp. It does not dial the network. It does not sign APKs itself: apksigner asks it to sign through a local PKCS#11 module, and the private key stays inside the vault.
 
 The vault is a vaultcore directory container. One profile lives inside it:
 
 ```text
-profiles/<name>/nsec     private key, secret flag
-profiles/<name>/bunker   connect secret, token, ports
+profiles/<name>/nsec          Nostr private key, secret
+profiles/<name>/bunker        connect secret, token, ports
+profiles/<name>/android-key   Android private key, secret
+profiles/<name>/android       certificate chain and signing PIN
 ```
 
-`nsec` has no read command. Each signature calls `Vault.Use`, which decrypts the key for the callback and wipes it when the callback returns. `bunker` is ordinary ciphertext; the URL printed at startup is the same capability.
+`nsec` and `android-key` have no read command. Each signature calls `Vault.Use`, which decrypts that key for the callback and wipes it when the callback returns. `bunker` and `android` are ordinary ciphertext. The URL and the PIN printed at startup are the same capabilities.
 
 ```bash
 make
 ./hotbox
 ```
 
-With no arguments, hotbox asks for a path, where to keep the key, an nsec, and a password, prints the npub, then listens. The path is the container directory. A name that does not end in `.hotbox` gets that suffix. A relative path is taken from the working directory.
+With no arguments, hotbox asks for a path, where to keep the key, an nsec, a password, and an Android keystore, prints the npub, then listens. The keystore is JKS, PKCS#12, or an unencrypted PEM. It is read once, at creation. There is no command to add or replace the Android key. A vault created before that requirement has to be created again. The path is the container directory. A name that does not end in `.hotbox` gets that suffix. A relative path is taken from the working directory.
 
 Creating a vault asks where to keep the second secret: the macOS keychain (preselected when this machine has one), a key file, or the passphrase alone. A key file is 32 bytes, mode 0600. The default path is `<name>.key` in `$HOTBOX_KEYS`, or `~/.keys/hotbox` when that is unset. `zapstore.hotbox` uses `zapstore.key`. Pass another file with `--key`:
 
@@ -34,13 +36,18 @@ The password is stretched with Argon2id at 1 GiB of memory, so unlocking takes 1
 ./hotbox zapstore releases
 ```
 
-On a terminal, that asks for each password. When stdin is not a terminal, it reads one password line per vault, in the same order as the paths. Under systemd `Type=notify`, it signals ready after every vault is listening. It prints one line per vault:
+On a terminal, that asks for each password. When stdin is not a terminal, it reads one password line per vault, in the same order as the paths. Under systemd `Type=notify`, it signals ready after every vault is listening.
+
+Each bunker listens on `127.0.0.1` only, with ws and wss. The Android signer listens on a Unix socket under `/tmp/hotbox-<uid>` and accepts only this user. Startup prints one block per vault:
 
 ```text
 [zapstore] SIGN_WITH='bunker://…'
-[releases] SIGN_WITH='bunker://…'
+[zapstore] ANDROID_ALIAS='release'
+[zapstore] HOTBOX_TOKEN='/tmp/hotbox-501/….sock'
+[zapstore] HOTBOX_PIN='…'
+[zapstore] HOTBOX_PKCS11='/tmp/hotbox-501/….pkcs11.cfg'
 ```
 
-Each bunker listens on `127.0.0.1` only, with ws and wss.
+`make` also builds `dist/libhotbox-pkcs11-<os>-<arch>.dylib` (or `.so`) next to the binary. apksigner loads that module. The module forwards each signature to the socket. It never receives the private key. Pass `HOTBOX_TOKEN` in the environment and `HOTBOX_PIN` as `--ks-pass env:HOTBOX_PIN`. Java 21 also needs `JAVA_TOOL_OPTIONS=--add-exports=jdk.crypto.cryptoki/sun.security.pkcs11=ALL-UNNAMED`. The command is in the hotbox skill.
 
-Connections and signature attempts are logged to stderr, including a denied signature. The bunker URL stays on stdout. The private key is not logged.
+Connections and signature attempts are logged to stderr, including a denied signature. The bunker URL and the PIN stay on stdout. The private key is not logged.

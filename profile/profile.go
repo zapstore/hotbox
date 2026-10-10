@@ -1,9 +1,10 @@
 // Package profile stores one bunker identity in a vaultcore container.
 //
-// The private key is profiles/<name>/nsec and is marked secret, so the only
-// read path is Vault.Use. The connect secret, token, and ports are
-// profiles/<name>/bunker. Key calls Use: the private key exists only inside
-// the callback and is not returned.
+// The Nostr key is profiles/<name>/nsec and the Android key is
+// profiles/<name>/android-key. Both are marked secret, so the only read path
+// is Vault.Use. The connect secret, token, and ports are profiles/<name>/bunker.
+// The certificate chain and signing PIN are profiles/<name>/android.
+// Key and Android.Use decrypt a key only for the callback.
 package profile
 
 import (
@@ -17,6 +18,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 
 	btcec "github.com/btcsuite/btcd/btcec/v2"
 	"github.com/nbd-wtf/go-nostr/nip19"
@@ -38,6 +40,7 @@ type Profile struct {
 	WSSPort uint16
 	Npub    string
 	Key     func(context.Context, func([]byte) error) error
+	Android Android
 }
 
 // Wipe clears the capability fields. It does not affect Key.
@@ -47,13 +50,15 @@ func (p *Profile) Wipe() {
 	}
 	p.Connect = [32]byte{}
 	p.Token = [16]byte{}
+	p.Android.Wipe()
 	runtime.KeepAlive(p)
 }
 
 // Create seals a new directory container holding one profile and returns it open.
 // secret is the 32-byte Nostr private key. The caller wipes secret and password.
 // keyFile is the key path. It is empty when opts select the keychain or no key file.
-func Create(ctx context.Context, path, keyFile, name string, password, secret []byte, connect [32]byte, token [16]byte, wsPort, wssPort uint16, opts ...vaultcore.Option) (*vaultcore.Vault, Profile, error) {
+// android is sealed in the same call. There is no later way to add or replace it.
+func Create(ctx context.Context, path, keyFile, name string, password, secret []byte, connect [32]byte, token [16]byte, wsPort, wssPort uint16, android AndroidKey, opts ...vaultcore.Option) (*vaultcore.Vault, Profile, error) {
 	if err := validName(name); err != nil {
 		return nil, Profile{}, err
 	}
@@ -61,6 +66,9 @@ func Create(ctx context.Context, path, keyFile, name string, password, secret []
 		return nil, Profile{}, err
 	}
 	if err := validSecret(secret); err != nil {
+		return nil, Profile{}, err
+	}
+	if err := validAndroid(android); err != nil {
 		return nil, Profile{}, err
 	}
 	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
@@ -82,6 +90,17 @@ func Create(ctx context.Context, path, keyFile, name string, password, secret []
 	body := encodeBunker(connect, token, wsPort, wssPort)
 	defer wipe(body)
 	if err := v.Add(ctx, bunkerPath(name), bytes.NewReader(body), false); err != nil {
+		return nil, Profile{}, err
+	}
+	meta, err := encodeAndroid(android)
+	if err != nil {
+		return nil, Profile{}, err
+	}
+	defer wipe(meta)
+	if err := v.Add(ctx, androidPath(name), bytes.NewReader(meta), false); err != nil {
+		return nil, Profile{}, err
+	}
+	if err := v.Add(ctx, androidKeyPath(name), bytes.NewReader(android.PKCS8), true); err != nil {
 		return nil, Profile{}, err
 	}
 	p, err := load(ctx, v, name)
@@ -128,6 +147,11 @@ func load(ctx context.Context, v *vaultcore.Vault, name string) (Profile, error)
 	if err != nil {
 		return Profile{}, err
 	}
+	alias, pin, certs, err := readAndroid(ctx, v, name)
+	if err != nil {
+		return Profile{}, err
+	}
+	var gate sync.Mutex
 	p := Profile{
 		Name:    name,
 		Connect: connect,
@@ -135,7 +159,19 @@ func load(ctx context.Context, v *vaultcore.Vault, name string) (Profile, error)
 		WSPort:  ws,
 		WSSPort: wss,
 		Key: func(ctx context.Context, fn func([]byte) error) error {
+			gate.Lock()
+			defer gate.Unlock()
 			return v.Use(ctx, nsecPath(name), fn)
+		},
+		Android: Android{
+			Alias: alias,
+			PIN:   pin,
+			Certs: certs,
+			Use: func(ctx context.Context, fn func([]byte) error) error {
+				gate.Lock()
+				defer gate.Unlock()
+				return v.Use(ctx, androidKeyPath(name), fn)
+			},
 		},
 	}
 	if err := p.Key(ctx, func(key []byte) error {
@@ -160,12 +196,27 @@ func confirmSecret(v *vaultcore.Vault, name string) error {
 	if err != nil {
 		return err
 	}
+	var nsec, key, meta bool
 	for _, e := range entries {
-		if e.Name == "nsec" && !e.Dir && e.Secret {
-			return nil
+		if e.Dir {
+			continue
+		}
+		switch e.Name {
+		case "nsec":
+			nsec = e.Secret
+		case "android-key":
+			key = e.Secret
+		case "android":
+			meta = !e.Secret
 		}
 	}
-	return errors.New("nsec entry is missing or not secret")
+	if !nsec {
+		return errors.New("nsec entry is missing or not secret")
+	}
+	if !key || !meta {
+		return errors.New("android signing key is missing or not secret")
+	}
+	return nil
 }
 
 func findProfile(v *vaultcore.Vault) (string, error) {
@@ -235,6 +286,19 @@ func encodeBunker(connect [32]byte, token [16]byte, ws, wss uint16) []byte {
 	binary.BigEndian.PutUint16(buf[49:51], ws)
 	binary.BigEndian.PutUint16(buf[51:53], wss)
 	return buf
+}
+
+func readAndroid(ctx context.Context, v *vaultcore.Vault, name string) (alias string, pin [32]byte, certs [][]byte, err error) {
+	var w capWriter
+	w.max = maxAndroidMeta
+	if err = v.Cat(ctx, androidPath(name), &w); err != nil {
+		if errors.Is(err, vaultcore.ErrNotFound) {
+			err = errors.New("android signing key is missing or not secret")
+		}
+		return
+	}
+	defer wipe(w.buf)
+	return decodeAndroid(w.buf)
 }
 
 func nsecPath(name string) string   { return "profiles/" + name + "/nsec" }

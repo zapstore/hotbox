@@ -3,9 +3,14 @@ package profile_test
 import (
 	"bytes"
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
 	"crypto/rand"
+	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/hex"
 	"errors"
+	"math/big"
 	"net"
 	"os"
 	"path/filepath"
@@ -44,7 +49,7 @@ func TestSecretIsOnlyAvailableInsideUse(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if res.Skipped != 1 || res.Files != 1 {
+	if res.Skipped != 2 || res.Files != 2 {
 		t.Fatalf("export files=%d skipped=%d", res.Files, res.Skipped)
 	}
 	matches, err := filepath.Glob(filepath.Join(dest, "profiles", prof.Name, "nsec"))
@@ -53,6 +58,29 @@ func TestSecretIsOnlyAvailableInsideUse(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(dest, "profiles", prof.Name, "bunker")); err != nil {
 		t.Fatal(err)
+	}
+	buf.Reset()
+	if err := v.Cat(ctx, "profiles/"+prof.Name+"/android-key", &buf); !errors.Is(err, vaultcore.ErrSecret) {
+		t.Fatalf("cat android key: %v", err)
+	}
+	buf.Reset()
+	if err := v.Cat(ctx, "profiles/"+prof.Name+"/android", &buf); err != nil {
+		t.Fatal(err)
+	}
+	var pkcs8 []byte
+	if err := prof.Android.Use(ctx, func(key []byte) error {
+		pkcs8 = append([]byte(nil), key...)
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		for i := range pkcs8 {
+			pkcs8[i] = 0
+		}
+	}()
+	if bytes.Contains(buf.Bytes(), pkcs8) {
+		t.Fatal("android entry contains the private key")
 	}
 
 	var signed gonostr.Event
@@ -88,7 +116,7 @@ func TestBunkerSignsThroughUse(t *testing.T) {
 	var token [16]byte
 	connect[0] = 7
 	token[0] = 9
-	v, prof, err := profile.Create(ctx, path, keys, "zapstore", []byte("correct horse battery"), secret, connect, token, port(t, wsLn), port(t, wssLn))
+	v, prof, err := profile.Create(ctx, path, keys, "zapstore", []byte("correct horse battery"), secret, connect, token, port(t, wsLn), port(t, wssLn), testAndroid(t))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -101,7 +129,7 @@ func TestBunkerSignsThroughUse(t *testing.T) {
 		_ = v.Close()
 		t.Fatal(err)
 	}
-	if prof.Connect != [32]byte{} || prof.Token != [16]byte{} {
+	if prof.Connect != [32]byte{} || prof.Token != [16]byte{} || prof.Android.PIN != [32]byte{} {
 		t.Fatal("capability remained on the profile")
 	}
 	prefix, decoded, err := nip19.Decode(npub)
@@ -186,7 +214,7 @@ func TestCreateNoKeyFile(t *testing.T) {
 	var token [16]byte
 	connect[0] = 3
 	token[0] = 4
-	v, prof, err := profile.Create(ctx, path, "", "zapstore", []byte("correct horse battery"), secret, connect, token, 10001, 10002, vaultcore.NoKeyFile())
+	v, prof, err := profile.Create(ctx, path, "", "zapstore", []byte("correct horse battery"), secret, connect, token, 10001, 10002, testAndroid(t), vaultcore.NoKeyFile())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -225,12 +253,37 @@ func createProfile(t *testing.T, ctx context.Context, secret []byte) (*vaultcore
 	if _, err := rand.Read(token[:]); err != nil {
 		t.Fatal(err)
 	}
-	v, prof, err := profile.Create(ctx, path, keys, "zapstore", []byte("correct horse battery"), secret, connect, token, 10001, 10002)
+	v, prof, err := profile.Create(ctx, path, keys, "zapstore", []byte("correct horse battery"), secret, connect, token, 10001, 10002, testAndroid(t))
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = v.Close() })
 	return v, prof, path, keys
+}
+
+func testAndroid(t *testing.T) profile.AndroidKey {
+	t.Helper()
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tmpl := &x509.Certificate{
+		SerialNumber: big.NewInt(1),
+		Subject:      pkix.Name{CommonName: "zapstore"},
+		NotBefore:    time.Now().Add(-time.Hour),
+		NotAfter:     time.Now().Add(time.Hour),
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pkcs8, err := x509.MarshalPKCS8PrivateKey(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var pin [32]byte
+	copy(pin[:], []byte("0123456789abcdef0123456789abcdef"))
+	return profile.AndroidKey{Alias: "zapstore", PIN: pin, PKCS8: pkcs8, Certs: [][]byte{der}}
 }
 
 func testSecret(t *testing.T) []byte {
