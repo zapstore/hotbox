@@ -41,7 +41,7 @@ func run() error {
 	if help {
 		fmt.Fprint(os.Stdout, `Usage:
   hotbox [--key file]
-      Create a vault. Asks for a path, an nsec, and a password, prints the npub, then runs the bunker.
+      Create a vault. Asks for a path, where to keep the key, an nsec, and a password, prints the npub, then runs the bunker.
   hotbox [--key file] <vault> [--key file] <vault> ...
       Unlock each vault and run a bunker for each.
       A vault is a directory whose name ends in .hotbox. If you omit that suffix, it is added.
@@ -51,15 +51,20 @@ The private key is stored at profiles/<name>/nsec and marked secret. Signing
 decrypts it only for the duration of the signature. Connect secret, token, and
 ports are stored at profiles/<name>/bunker.
 
-The key file defaults to <name>.key in $HOTBOX_KEYS, or `+defaultKeyDirHelp+` when that
-is unset. name is the vault name, so zapstore.hotbox uses zapstore.key.
---key sets the file for the next vault only:
+Creation asks for the macOS keychain, a key file, or the passphrase alone.
+The keychain is preselected when this machine has one. A key file defaults
+to <name>.key in $HOTBOX_KEYS, or `+defaultKeyDirHelp+` when that is unset.
+name is the vault name, so zapstore.hotbox uses zapstore.key.
+--key sets the file for the next vault only, and that vault uses a file:
 
   hotbox zapstore releases
   hotbox --key /path/to/zapstore.key zapstore --key /path/to/releases.key releases
 
-Neither the nsec nor the key file can be recovered from the vault. If one is
-lost, create a new vault from your nsec.
+With no --key, a Mac looks in the keychain first and then the default key
+file. A vault with no key file opens with the passphrase alone.
+
+Neither the nsec nor a key file or keychain entry can be recovered from the
+vault. If one is lost, create a new vault from your nsec.
 
 Connections and signature attempts are logged to stderr. The bunker URL and
 the private key are not logged.
@@ -156,6 +161,14 @@ func createAndRun(ctx context.Context, log *slog.Logger, key string) error {
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
+	choice, err := askKeyStorage()
+	if err != nil {
+		return err
+	}
+	keyFile, opts, err := createKeyArgs(choice, key, path)
+	if err != nil {
+		return err
+	}
 	nsec, err := ask("Nostr private key", "nsec1… or 64-character hex. It is sealed inside the vault.", true, validNsec)
 	if err != nil {
 		return err
@@ -205,26 +218,26 @@ func createAndRun(ctx context.Context, log *slog.Logger, key string) error {
 	if _, err := rand.Read(token[:]); err != nil {
 		return err
 	}
-	keyFile, err := vaultKey(path, key)
-	if err != nil {
-		return err
-	}
-	v, prof, err := profile.Create(ctx, path, keyFile, label, pw, secret[:], connect, token, wsPort, wssPort)
+	v, prof, err := profile.Create(ctx, path, keyFile, label, pw, secret[:], connect, token, wsPort, wssPort, opts...)
 	if err != nil {
 		return err
 	}
 	defer v.Close()
+	stored := v.KeyStorage()
+	status("created %s", path)
+	status("%s", stored.BackupAdvice())
+	if stored.Kind == vaultcore.KeyInFile {
+		status("open with: hotbox --key %s %s", stored.Location, path)
+	} else {
+		status("open with: hotbox %s", path)
+	}
 	running, err := bunker.Start(ctx, prof.Key, prof.Connect, prof.Token, wsLn, wssLn, nil, log)
 	npub := prof.Npub
-	keyFile = v.KeyFile()
 	prof.Wipe()
 	if err != nil {
 		return err
 	}
 	started = true
-	status("created %s", path)
-	status("key file %s", keyFile)
-	status("open with: hotbox --key %s %s", keyFile, path)
 	status("[%s] %s", label, npub)
 	return serve([]signer{{label: label, bunker: running}})
 }
@@ -286,11 +299,11 @@ func openAndRun(ctx context.Context, vaults []cliVault, log *slog.Logger) error 
 		if err != nil {
 			return err
 		}
-		keyFile, err := vaultKey(spec.path, spec.key)
+		keyFile, opts, err := openKeyArgs(spec.key, spec.path)
 		if err != nil {
 			return err
 		}
-		v, prof, err := profile.Open(ctx, spec.path, keyFile, password)
+		v, prof, err := profile.Open(ctx, spec.path, keyFile, password, opts...)
 		clear(password)
 		if err != nil {
 			return fmt.Errorf("%s: %w", spec.label, err)
@@ -382,7 +395,73 @@ func listenVault(ws, wss uint16) (net.Listener, net.Listener, error) {
 const (
 	keyDirEnv         = "HOTBOX_KEYS"
 	defaultKeyDirHelp = "~/.keys/hotbox"
+
+	keychainChoice = "keychain"
+	fileChoice     = "file"
+	noneChoice     = "none"
 )
+
+// askKeyStorage offers the keychain, a key file, or the passphrase alone.
+// The keychain is the initial selection when this machine has one.
+func askKeyStorage() (string, error) {
+	choice := fileChoice
+	if vaultcore.KeychainSupported() {
+		choice = keychainChoice
+	}
+	err := huh.NewSelect[string]().
+		Title("Key storage").
+		Description("A second secret kept outside the vault, or the passphrase alone.").
+		Options(
+			huh.NewOption("macOS keychain", keychainChoice),
+			huh.NewOption("Key file", fileChoice),
+			huh.NewOption("Passphrase only", noneChoice),
+		).
+		Value(&choice).
+		Run()
+	if err != nil {
+		return "", err
+	}
+	return choice, nil
+}
+
+// createKeyArgs maps a creation choice to the key path and Create options.
+// explicit is the --key path and applies only to a key file.
+func createKeyArgs(choice, explicit, vaultPath string) (string, []vaultcore.Option, error) {
+	switch choice {
+	case keychainChoice, noneChoice:
+		if strings.TrimSpace(explicit) != "" {
+			return "", nil, errors.New("--key applies only when the key is stored in a file")
+		}
+		if choice == keychainChoice {
+			return "", []vaultcore.Option{vaultcore.Keychain()}, nil
+		}
+		return "", []vaultcore.Option{vaultcore.NoKeyFile()}, nil
+	case fileChoice:
+		path, err := vaultKey(vaultPath, explicit)
+		return path, nil, err
+	default:
+		return "", nil, errors.New("key storage choice is invalid")
+	}
+}
+
+// openKeyArgs is the key path and options for Open. An explicit --key uses
+// only that file. Otherwise a Mac tries the keychain and falls back to the
+// default key file.
+func openKeyArgs(explicit, vaultPath string) (string, []vaultcore.Option, error) {
+	if strings.TrimSpace(explicit) != "" {
+		path, err := resolvePath(explicit)
+		return path, nil, err
+	}
+	var opts []vaultcore.Option
+	if vaultcore.KeychainSupported() {
+		opts = []vaultcore.Option{vaultcore.Keychain()}
+	}
+	path, err := vaultKey(vaultPath, "")
+	if err != nil && len(opts) > 0 {
+		return "", opts, nil
+	}
+	return path, opts, err
+}
 
 // vaultKey is the key file for a vault. An explicit path is used as given.
 // Otherwise the file is <name>.key in $HOTBOX_KEYS, or ~/.keys/hotbox.

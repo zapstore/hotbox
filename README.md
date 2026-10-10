@@ -16,17 +16,17 @@ make
 ./hotbox
 ```
 
-With no arguments, hotbox asks for a path, an nsec, and a password, prints the npub, then listens. The path is the container directory. A name that does not end in `.hotbox` gets that suffix. A relative path is taken from the working directory.
+With no arguments, hotbox asks for a path, where to keep the key, an nsec, and a password, prints the npub, then listens. The path is the container directory. A name that does not end in `.hotbox` gets that suffix. A relative path is taken from the working directory.
 
-Creating a vault also writes a 32-byte key file, mode 0600. The default path is `<name>.key` in `$HOTBOX_KEYS`, or `~/.keys/hotbox` when that is unset. `zapstore.hotbox` uses `zapstore.key`. Pass another file with `--key`:
+Creating a vault asks where to keep the second secret: the macOS keychain (preselected when this machine has one), a key file, or the passphrase alone. A key file is 32 bytes, mode 0600. The default path is `<name>.key` in `$HOTBOX_KEYS`, or `~/.keys/hotbox` when that is unset. `zapstore.hotbox` uses `zapstore.key`. Pass another file with `--key`:
 
 ```bash
 ./hotbox --key /path/to/zapstore.key zapstore --key /path/to/releases.key releases
 ```
 
-Opening a vault needs both the password and that file. A leaked container on its own is not an offline password-guessing target.
+Opening a vault needs the password and, unless the vault was created with the passphrase alone, the keychain entry or the key file. With no `--key`, a Mac looks in the keychain first and then the default key file. A leaked container that has a key is not an offline password-guessing target. A passphrase-only vault is. After creation, hotbox prints what to back up.
 
-Nothing recovers the nsec from the container. If the password or the key file is lost, create a new vault from your own copy of the nsec. File vaults from hotbox v1 are not accepted.
+Nothing recovers the nsec from the container. If the password or the key is lost, create a new vault from your own copy of the nsec. File vaults from hotbox v1 are not accepted. Directory vaults already in vaultcore format version 1 stay readable: the keychain and passphrase-only choices do not change that format.
 
 The password is stretched with Argon2id at 1 GiB of memory, so unlocking takes 1–3 s and needs that much free RAM once per vault at start.
 

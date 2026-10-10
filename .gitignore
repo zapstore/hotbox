@@ -1,5 +1,7 @@
 /dist/
+/hotbox
 *.hotbox
+.DS_Store
 .agents/skills
 
 /go.work

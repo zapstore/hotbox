@@ -5,6 +5,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"vaultcore"
 )
 
 func TestParseArgs(t *testing.T) {
@@ -97,6 +99,56 @@ func TestKeyDir(t *testing.T) {
 	got, err = keyDir()
 	if err != nil || got[0] != '/' || filepath.Base(got) != "hotbox-keys" {
 		t.Fatalf("env key dir %s err %v", got, err)
+	}
+}
+
+func TestCreateKeyArgs(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv(keyDirEnv, dir)
+	vault := filepath.Join(dir, "zapstore.hotbox")
+
+	path, opts, err := createKeyArgs(noneChoice, "", vault)
+	if err != nil || path != "" || len(opts) != 1 {
+		t.Fatalf("none path=%q opts=%d err=%v", path, len(opts), err)
+	}
+	if _, _, err := createKeyArgs(keychainChoice, filepath.Join(dir, "a.key"), vault); err == nil {
+		t.Fatal("accepted --key with the keychain")
+	}
+	if _, _, err := createKeyArgs(noneChoice, filepath.Join(dir, "a.key"), vault); err == nil {
+		t.Fatal("accepted --key with no key file")
+	}
+	path, opts, err = createKeyArgs(fileChoice, filepath.Join(dir, "a.key"), vault)
+	if err != nil || path != filepath.Join(dir, "a.key") || len(opts) != 0 {
+		t.Fatalf("file path=%q opts=%d err=%v", path, len(opts), err)
+	}
+	path, opts, err = createKeyArgs(fileChoice, "", vault)
+	if err != nil || path != filepath.Join(dir, "zapstore.key") || len(opts) != 0 {
+		t.Fatalf("default file path=%q opts=%d err=%v", path, len(opts), err)
+	}
+	if _, _, err := createKeyArgs("elsewhere", "", vault); err == nil {
+		t.Fatal("accepted an unknown choice")
+	}
+}
+
+func TestOpenKeyArgs(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv(keyDirEnv, dir)
+	vault := filepath.Join(dir, "zapstore.hotbox")
+
+	path, opts, err := openKeyArgs(filepath.Join(dir, "a.key"), vault)
+	if err != nil || path != filepath.Join(dir, "a.key") || len(opts) != 0 {
+		t.Fatalf("explicit path=%q opts=%d err=%v", path, len(opts), err)
+	}
+	path, opts, err = openKeyArgs("", vault)
+	if err != nil || path != filepath.Join(dir, "zapstore.key") {
+		t.Fatalf("default path=%q err=%v", path, err)
+	}
+	if vaultcore.KeychainSupported() {
+		if len(opts) != 1 {
+			t.Fatalf("keychain opts=%d", len(opts))
+		}
+	} else if len(opts) != 0 {
+		t.Fatalf("file opts=%d", len(opts))
 	}
 }
 

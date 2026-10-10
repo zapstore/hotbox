@@ -52,7 +52,8 @@ func (p *Profile) Wipe() {
 
 // Create seals a new directory container holding one profile and returns it open.
 // secret is the 32-byte Nostr private key. The caller wipes secret and password.
-func Create(ctx context.Context, path, keyFile, name string, password, secret []byte, connect [32]byte, token [16]byte, wsPort, wssPort uint16) (*vaultcore.Vault, Profile, error) {
+// keyFile is the key path. It is empty when opts select the keychain or no key file.
+func Create(ctx context.Context, path, keyFile, name string, password, secret []byte, connect [32]byte, token [16]byte, wsPort, wssPort uint16, opts ...vaultcore.Option) (*vaultcore.Vault, Profile, error) {
 	if err := validName(name); err != nil {
 		return nil, Profile{}, err
 	}
@@ -65,7 +66,7 @@ func Create(ctx context.Context, path, keyFile, name string, password, secret []
 	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
 		return nil, Profile{}, err
 	}
-	v, err := vaultcore.Create(ctx, path, keyFile, password)
+	v, err := vaultcore.Create(ctx, path, keyFile, password, opts...)
 	if err != nil {
 		return nil, Profile{}, err
 	}
@@ -94,7 +95,7 @@ func Create(ctx context.Context, path, keyFile, name string, password, secret []
 // Open unlocks a directory container and loads its single profile.
 // The caller must close the vault. A second open while this one is held
 // returns vaultcore.ErrBusy.
-func Open(ctx context.Context, path, keyFile string, password []byte) (*vaultcore.Vault, Profile, error) {
+func Open(ctx context.Context, path, keyFile string, password []byte, opts ...vaultcore.Option) (*vaultcore.Vault, Profile, error) {
 	info, err := os.Stat(path)
 	if err != nil {
 		return nil, Profile{}, err
@@ -102,7 +103,7 @@ func Open(ctx context.Context, path, keyFile string, password []byte) (*vaultcor
 	if !info.IsDir() {
 		return nil, Profile{}, errors.New("vault is not a directory container")
 	}
-	v, err := vaultcore.Open(ctx, path, keyFile, password)
+	v, err := vaultcore.Open(ctx, path, keyFile, password, opts...)
 	if err != nil {
 		return nil, Profile{}, err
 	}

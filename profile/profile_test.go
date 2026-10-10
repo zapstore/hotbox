@@ -9,6 +9,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -173,6 +174,41 @@ func TestRejectsExtraProfileAndFile(t *testing.T) {
 	_, _, err := profile.Open(ctx, file, keys, []byte("correct horse battery"))
 	if err == nil || err.Error() != "vault is not a directory container" {
 		t.Fatalf("file vault: %v", err)
+	}
+}
+
+func TestCreateNoKeyFile(t *testing.T) {
+	ctx := t.Context()
+	secret := testSecret(t)
+	dir := t.TempDir()
+	path := filepath.Join(dir, "zapstore.vault")
+	var connect [32]byte
+	var token [16]byte
+	connect[0] = 3
+	token[0] = 4
+	v, prof, err := profile.Create(ctx, path, "", "zapstore", []byte("correct horse battery"), secret, connect, token, 10001, 10002, vaultcore.NoKeyFile())
+	if err != nil {
+		t.Fatal(err)
+	}
+	ks := v.KeyStorage()
+	if ks.Kind != vaultcore.KeyNone || ks.Location != "" || !strings.Contains(ks.BackupAdvice(), "no key file") {
+		t.Fatalf("storage %+v advice %q", ks, ks.BackupAdvice())
+	}
+	if prof.Name != "zapstore" {
+		t.Fatalf("name %s", prof.Name)
+	}
+	if err := v.Close(); err != nil {
+		t.Fatal(err)
+	}
+	again, opened, err := profile.Open(ctx, path, "", []byte("correct horse battery"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if opened.Name != "zapstore" || again.KeyStorage().Kind != vaultcore.KeyNone {
+		t.Fatalf("reopen name=%s kind=%s", opened.Name, again.KeyStorage().Kind)
+	}
+	if err := again.Close(); err != nil {
+		t.Fatal(err)
 	}
 }
 
