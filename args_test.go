@@ -166,6 +166,19 @@ func TestVaultLabel(t *testing.T) {
 	}
 }
 
+func TestEnvBlock(t *testing.T) {
+	if got := envBlock("zapstore", false, "bunker://abc", "", ""); got != "SIGN_WITH='bunker://abc'\n" {
+		t.Fatalf("create %q", got)
+	}
+	android := "SIGN_WITH='bunker://abc'\nHOTBOX_PIN='pin'\nHOTBOX_SOCKET='/tmp/hotbox.sock'\n"
+	if got := envBlock("zapstore", false, "bunker://abc", "pin", "/tmp/hotbox.sock"); got != android {
+		t.Fatalf("create android %q", got)
+	}
+	if got := envBlock("releases", true, "bunker://abc", "pin", "/tmp/hotbox.sock"); got != "[releases]\n"+android {
+		t.Fatalf("open %q", got)
+	}
+}
+
 func TestClaimPorts(t *testing.T) {
 	used := map[uint16]string{}
 	if err := claimPorts(used, "zapstore", 1, 2); err != nil {

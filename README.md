@@ -26,7 +26,7 @@ Creating a vault asks where to keep the second secret: the macOS keychain (prese
 ./hotbox --key /path/to/zapstore.key zapstore --key /path/to/releases.key releases
 ```
 
-Opening a vault needs the password and, unless the vault was created with the passphrase alone, the keychain entry or the key file. With no `--key`, a Mac looks in the keychain first and then the default key file. A leaked container that has a key is not an offline password-guessing target. A passphrase-only vault is. After creation, hotbox prints what to back up.
+Opening a vault needs the password and, unless the vault was created with the passphrase alone, the keychain entry or the key file. With no `--key`, a Mac looks in the keychain first and then the default key file. A leaked container that has a key is not an offline password-guessing target. A passphrase-only vault is. After creation, hotbox prints the key location and the .env block.
 
 Nothing recovers the nsec from the container. If the password or the key is lost, create a new vault from your own copy of the nsec. File vaults from hotbox v1 are not accepted. Directory vaults already in vaultcore format version 1 stay readable: the keychain and passphrase-only choices do not change that format.
 
@@ -38,16 +38,29 @@ The password is stretched with Argon2id at 1 GiB of memory, so unlocking takes 1
 
 On a terminal, that asks for each password. When stdin is not a terminal, it reads one password line per vault, in the same order as the paths. Under systemd `Type=notify`, it signals ready after every vault is listening.
 
-Each bunker listens on `127.0.0.1` only, with ws and wss. A vault with an Android key also listens on a Unix socket and accepts only this user. The socket and the PKCS#11 config are `/tmp/hotbox-<uid>/<name>.sock` and `/tmp/hotbox-<uid>/<name>.pkcs11.cfg`. `<name>` is the vault name with `.hotbox` removed. Those two paths stay the same across runs. A vault holds one profile, so it has one npub and at most one Android key. Startup prints one `.env` block per vault. `HOTBOX_SOCKET` and `HOTBOX_PIN` appear only when an Android key was sealed:
+Each bunker listens on `127.0.0.1` only, with ws and wss. A vault with an Android key also listens on a Unix socket and accepts only this user. The socket and the PKCS#11 config are `/tmp/hotbox-<uid>/<name>.sock` and `/tmp/hotbox-<uid>/<name>.pkcs11.cfg`. `<name>` is the vault name with `.hotbox` removed. Those two paths stay the same across runs. A vault holds one profile, so it has one npub and at most one Android key. Creation prints the key location, then the `.env` lines. Opening vaults prefixes each vault with `[name]`. `HOTBOX_PIN` and `HOTBOX_SOCKET` appear only when an Android key was sealed:
 
 ```text
-# zapstore: paste into the project .env, then chmod 600 .env and keep it out of git
-HOTBOX_SOCKET='/tmp/hotbox-501/zapstore.sock'
+keychain vaultcore/…
+```
+
+```text
+SIGN_WITH='bunker://…'
 HOTBOX_PIN='…'
+HOTBOX_SOCKET='/tmp/hotbox-501/zapstore.sock'
+```
+
+```text
+[zapstore]
+SIGN_WITH='bunker://…'
+HOTBOX_PIN='…'
+HOTBOX_SOCKET='/tmp/hotbox-501/zapstore.sock'
+
+[releases]
 SIGN_WITH='bunker://…'
 ```
 
-Paste the block into the project `.env` as is. Anyone who can read that file can sign as you while hotbox is unlocked, so keep it mode 0600 and out of git. `hotbox sign` and `zsp` refuse a `.env` that other users can read. Stopping hotbox stops all signing.
+Paste the `SIGN_WITH` lines into the project `.env`, and `HOTBOX_PIN` and `HOTBOX_SOCKET` when they are present. Anyone who can read that file can sign as you while hotbox is unlocked, so keep it mode 0600 and out of git. `hotbox sign` and `zsp` refuse a `.env` that other users can read. Stopping hotbox stops all signing.
 
 `make` also builds `dist/libhotbox-pkcs11-<os>-<arch>.dylib` (or `.so`) next to the binary. apksigner loads that module. The module forwards each signature to the socket. It never receives the private key. The key alias is `hotbox`.
 

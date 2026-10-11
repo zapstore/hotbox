@@ -87,8 +87,10 @@ the private key are not logged.
 On a terminal, asks for each vault password. When stdin is not a terminal
 (a pipe, or a service that passes passwords on stdin), reads one line per
 vault, in the same order as the paths.
-Prints a .env block for each vault: SIGN_WITH, and for a vault with an Android
-key also HOTBOX_SOCKET and HOTBOX_PIN. Paste it into the project .env as is.
+Creation prints the key location and one .env block: SIGN_WITH, plus
+HOTBOX_PIN and HOTBOX_SOCKET when the vault has an Android key. Opening
+vaults prints that block for each, prefixed with [name]. Paste a block into
+the project .env as is.
 The socket and the PKCS#11 config are /tmp/hotbox-<uid>/<name>.sock and
 .pkcs11.cfg, and they stay the same across runs. The key alias is always hotbox.
 The PKCS#11 module asks hotbox to sign and never receives the private key.
@@ -249,29 +251,20 @@ func createAndRun(ctx context.Context, log *slog.Logger, key string) error {
 		return err
 	}
 	defer v.Close()
-	stored := v.KeyStorage()
-	status("created %s", path)
-	status("%s", stored.BackupAdvice())
-	if stored.Kind == vaultcore.KeyInFile {
-		status("open with: hotbox --key %s %s", stored.Location, path)
-	} else {
-		status("open with: hotbox %s", path)
-	}
+	reportKey(v.KeyStorage())
 	tok, err := startToken(ctx, prof, log)
 	if err != nil {
 		prof.Wipe()
 		return err
 	}
 	running, err := bunker.Start(ctx, prof.Key, prof.Connect, prof.Token, wsLn, wssLn, nil, log)
-	npub := prof.Npub
 	prof.Wipe()
 	if err != nil {
 		tok.Close()
 		return err
 	}
 	started = true
-	status("[%s] %s", label, npub)
-	return serve([]signer{{label: label, bunker: running, token: tok}})
+	return serve([]signer{{label: label, bunker: running, token: tok}}, false)
 }
 
 type vaultSpec struct {
@@ -359,53 +352,67 @@ func openAndRun(ctx context.Context, vaults []cliVault, log *slog.Logger) error 
 			return fmt.Errorf("%s: %w", spec.label, err)
 		}
 		started, err := bunker.Start(ctx, prof.Key, prof.Connect, prof.Token, ws, wss, nil, log)
-		npub := prof.Npub
 		prof.Wipe()
 		if err != nil {
 			tok.Close()
 			return fmt.Errorf("%s: %w", spec.label, err)
 		}
-		running = append(running, signer{label: spec.label, npub: npub, bunker: started, token: tok})
+		running = append(running, signer{label: spec.label, bunker: started, token: tok})
 	}
-	for _, s := range running {
-		status("hotbox: [%s] %s", s.label, s.npub)
-	}
-	return serve(running)
+	return serve(running, true)
 }
 
-// envBlock is the .env text for one vault. It is printed once, to stdout.
-func envBlock(label, signWith string, tok *token.Token) string {
-	var b strings.Builder
-	fmt.Fprintf(&b, "\n# %s: paste into the project .env, then chmod 600 .env and keep it out of git\n", label)
-	if tok != nil {
-		fmt.Fprintf(&b, "HOTBOX_SOCKET='%s'\n", tok.Path)
-		fmt.Fprintf(&b, "HOTBOX_PIN='%s'\n", tok.Pin())
+// reportKey prints where the key lives. The account is service/account.
+func reportKey(stored vaultcore.KeyStorage) {
+	switch stored.Kind {
+	case vaultcore.KeyInFile:
+		status("key %s", stored.Location)
+	case vaultcore.KeyInKeychain:
+		status("keychain %s", stored.Location)
 	}
-	fmt.Fprintf(&b, "SIGN_WITH='%s'\n\n", signWith)
+}
+
+// envBlock is the .env text for one vault, printed once to stdout.
+// prefix is set when opening vaults. Creation prints a single block with no name.
+func envBlock(label string, prefix bool, signWith, pin, socket string) string {
+	var b strings.Builder
+	if prefix {
+		fmt.Fprintf(&b, "[%s]\n", label)
+	}
+	fmt.Fprintf(&b, "SIGN_WITH='%s'\n", signWith)
+	if pin != "" {
+		fmt.Fprintf(&b, "HOTBOX_PIN='%s'\n", pin)
+		fmt.Fprintf(&b, "HOTBOX_SOCKET='%s'\n", socket)
+	}
 	return b.String()
 }
 
 type signer struct {
 	label  string
-	npub   string
 	bunker *bunker.Bunker
 	token  *token.Token
 }
 
-func serve(running []signer) error {
+func serve(running []signer, prefix bool) error {
 	defer func() {
 		for _, s := range running {
 			s.bunker.Close()
 			s.token.Close()
 		}
 	}()
-	for _, s := range running {
-		fmt.Print(envBlock(s.label, s.bunker.URL(), s.token))
+	for i, s := range running {
+		if i > 0 {
+			fmt.Println()
+		}
+		pin, socket := "", ""
+		if s.token != nil {
+			pin, socket = s.token.Pin(), s.token.Path
+		}
+		fmt.Print(envBlock(s.label, prefix, s.bunker.URL(), pin, socket))
 		if s.token != nil && s.token.Config == "" {
 			status("pkcs11 module is not next to the hotbox binary; rebuild with make")
 		}
 	}
-	status("local ws and wss only; interrupt to lock")
 	if err := notifyReady(); err != nil {
 		return err
 	}
