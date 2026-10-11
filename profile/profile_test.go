@@ -23,7 +23,7 @@ import (
 	"github.com/nbd-wtf/go-nostr/nip46"
 	"github.com/zapstore/hotbox/bunker"
 	"github.com/zapstore/hotbox/profile"
-	"vaultcore"
+	"vaultcore/vault"
 )
 
 func TestSecretIsOnlyAvailableInsideUse(t *testing.T) {

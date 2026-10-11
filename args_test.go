@@ -6,7 +6,7 @@ import (
 	"strings"
 	"testing"
 
-	"vaultcore"
+	"vaultcore/vault"
 )
 
 func TestParseArgs(t *testing.T) {

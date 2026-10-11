@@ -22,7 +22,7 @@ import (
 
 	btcec "github.com/btcsuite/btcd/btcec/v2"
 	"github.com/nbd-wtf/go-nostr/nip19"
-	"vaultcore"
+	"vaultcore/vault"
 )
 
 const bunkerSize = 1 + 32 + 16 + 2 + 2

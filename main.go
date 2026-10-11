@@ -28,7 +28,7 @@ import (
 	"github.com/zapstore/hotbox/keystore"
 	"github.com/zapstore/hotbox/profile"
 	"github.com/zapstore/hotbox/token"
-	"vaultcore"
+	"vaultcore/vault"
 )
 
 func main() {
