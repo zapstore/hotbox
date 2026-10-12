@@ -52,7 +52,8 @@ func run() error {
       Create a vault. Asks for a path, where to keep the key, an nsec, a password, and an optional Android keystore, prints the npub, then runs the bunker.
   hotbox [--key file] <vault> [--key file] <vault> ...
       Unlock each vault and run a bunker for each.
-      A vault is a directory whose name ends in .hotbox. If you omit that suffix, it is added.
+      A vault is a file whose name ends in .hotbox. If you omit that suffix, it is added.
+      A directory vault from an older hotbox still opens.
       A relative path is taken from the working directory. A leading ~/ is expanded.
       A vault named sign must be given as ./sign.
   hotbox sign <app-unsigned.apk>...
@@ -87,10 +88,12 @@ the private key are not logged.
 On a terminal, asks for each vault password. When stdin is not a terminal
 (a pipe, or a service that passes passwords on stdin), reads one line per
 vault, in the same order as the paths.
-Creation prints the key location and one .env block: SIGN_WITH, plus
-HOTBOX_PIN and HOTBOX_SOCKET when the vault has an Android key. Opening
-vaults prints that block for each, prefixed with [name]. Paste a block into
-the project .env as is.
+Creation prints the key, then one .env block: SIGN_WITH, plus HOTBOX_PIN
+and HOTBOX_SOCKET when the vault has an Android key. A key file prints its
+path. The keychain prints the key in hex. That hex is the backup, and
+xxd -r -p turns it into a key file for --key. Opening vaults prints the
+.env block for each, prefixed with [name]. Paste a block into the project
+.env as is.
 The socket and the PKCS#11 config are /tmp/hotbox-<uid>/<name>.sock and
 .pkcs11.cfg, and they stay the same across runs. The key alias is always hotbox.
 The PKCS#11 module asks hotbox to sign and never receives the private key.
@@ -167,7 +170,7 @@ func parseArgs(args []string) (vaults []cliVault, createKey string, help bool, e
 }
 
 func createAndRun(ctx context.Context, log *slog.Logger, key string) error {
-	raw, err := ask("Vault path", "Directory name. .hotbox is added if you leave it off. A relative path is taken from the working directory.", false, required)
+	raw, err := ask("Vault path", "File name. .hotbox is added if you leave it off. A relative path is taken from the working directory.", false, required)
 	if err != nil {
 		return err
 	}
@@ -251,7 +254,9 @@ func createAndRun(ctx context.Context, log *slog.Logger, key string) error {
 		return err
 	}
 	defer v.Close()
-	reportKey(v.KeyStorage())
+	if err := reportKey(v); err != nil {
+		return err
+	}
 	tok, err := startToken(ctx, prof, log)
 	if err != nil {
 		prof.Wipe()
@@ -301,8 +306,8 @@ func openAndRun(ctx context.Context, vaults []cliVault, log *slog.Logger) error 
 			}
 			return err
 		}
-		if !info.IsDir() {
-			return fmt.Errorf("vault %s is not a directory container", path)
+		if !info.IsDir() && !info.Mode().IsRegular() {
+			return fmt.Errorf("vault %s is not a container", path)
 		}
 		specs = append(specs, vaultSpec{path: path, label: label, key: vault.key})
 	}
@@ -362,14 +367,26 @@ func openAndRun(ctx context.Context, vaults []cliVault, log *slog.Logger) error 
 	return serve(running, true)
 }
 
-// reportKey prints where the key lives. The account is service/account.
-func reportKey(stored vaultcore.KeyStorage) {
+// reportKey prints the backup for the key paired with the passphrase.
+// A key file prints its path. The keychain prints the key in hex, which is
+// what `security find-generic-password -w` would return.
+func reportKey(v *vaultcore.Vault) error {
+	stored := v.KeyStorage()
 	switch stored.Kind {
 	case vaultcore.KeyInFile:
 		status("key %s", stored.Location)
 	case vaultcore.KeyInKeychain:
-		status("keychain %s", stored.Location)
+		raw, err := v.KeyCopy()
+		if err != nil || len(raw) == 0 {
+			if err == nil {
+				err = errors.New("key is empty")
+			}
+			return fmt.Errorf("read keychain key %s: %w", stored.Location, err)
+		}
+		defer clear(raw)
+		status("key %x", raw)
 	}
+	return nil
 }
 
 // envBlock is the .env text for one vault, printed once to stdout.

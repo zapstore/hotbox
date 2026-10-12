@@ -54,7 +54,7 @@ func (p *Profile) Wipe() {
 	runtime.KeepAlive(p)
 }
 
-// Create seals a new directory container holding one profile and returns it open.
+// Create seals a new single-file container holding one profile and returns it open.
 // secret is the 32-byte Nostr private key. The caller wipes secret and password.
 // keyFile is the key path. It is empty when opts select the keychain or no key file.
 // android is sealed in the same call when it is set. The zero value seals only
@@ -77,6 +77,7 @@ func Create(ctx context.Context, path, keyFile, name string, password, secret []
 	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
 		return nil, Profile{}, err
 	}
+	opts = append([]vaultcore.Option{vaultcore.SingleFile()}, opts...)
 	v, err := vaultcore.Create(ctx, path, keyFile, password, opts...)
 	if err != nil {
 		return nil, Profile{}, err
@@ -116,17 +117,11 @@ func Create(ctx context.Context, path, keyFile, name string, password, secret []
 	return v, p, nil
 }
 
-// Open unlocks a directory container and loads its single profile.
+// Open unlocks a container and loads its single profile.
+// A new vault is one file. A directory container from an older hotbox still opens.
 // The caller must close the vault. A second open while this one is held
 // returns vaultcore.ErrBusy.
 func Open(ctx context.Context, path, keyFile string, password []byte, opts ...vaultcore.Option) (*vaultcore.Vault, Profile, error) {
-	info, err := os.Stat(path)
-	if err != nil {
-		return nil, Profile{}, err
-	}
-	if !info.IsDir() {
-		return nil, Profile{}, errors.New("vault is not a directory container")
-	}
 	v, err := vaultcore.Open(ctx, path, keyFile, password, opts...)
 	if err != nil {
 		return nil, Profile{}, err
@@ -358,6 +353,8 @@ func abandon(v *vaultcore.Vault, path string) {
 	key := v.KeyFile()
 	_ = v.Close()
 	_ = os.RemoveAll(path)
+	_ = os.Remove(path + ".lock")
+	_ = os.Remove(path + ".writing")
 	if key != "" {
 		_ = os.Remove(key)
 	}

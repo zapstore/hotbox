@@ -200,8 +200,8 @@ func TestRejectsExtraProfileAndFile(t *testing.T) {
 		t.Fatal(err)
 	}
 	_, _, err := profile.Open(ctx, file, keys, []byte("correct horse battery"))
-	if err == nil || err.Error() != "vault is not a directory container" {
-		t.Fatalf("file vault: %v", err)
+	if !errors.Is(err, vaultcore.ErrAuth) {
+		t.Fatalf("legacy file: %v", err)
 	}
 }
 
@@ -301,6 +301,10 @@ func createProfile(t *testing.T, ctx context.Context, secret []byte) (*vaultcore
 	v, prof, err := profile.Create(ctx, path, keys, "zapstore", []byte("correct horse battery"), secret, connect, token, 10001, 10002, testAndroid(t))
 	if err != nil {
 		t.Fatal(err)
+	}
+	info, err := os.Stat(path)
+	if err != nil || !info.Mode().IsRegular() {
+		t.Fatalf("vault file: %v", err)
 	}
 	t.Cleanup(func() { _ = v.Close() })
 	return v, prof, path, keys
