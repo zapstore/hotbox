@@ -493,7 +493,7 @@ func startToken(ctx context.Context, prof profile.Profile, log *slog.Logger) (*t
 }
 
 func readAndroidKey() (profile.AndroidKey, error) {
-	raw, err := ask("Android keystore", "Optional. Leave empty to seal only the nsec. Otherwise JKS, PKCS#12, or unencrypted PEM. The file is not kept.", false, allowEmpty)
+	raw, err := askPath("Android keystore", "Optional. Leave empty to seal only the nsec. Otherwise JKS, PKCS#12, or unencrypted PEM. The file is not kept. Tab completes directories and keystores.")
 	if err != nil {
 		return profile.AndroidKey{}, err
 	}
