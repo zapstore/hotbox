@@ -466,10 +466,18 @@ func wipe(b []byte) {
 }
 
 // LibraryPath is the PKCS#11 module next to this executable, when it exists.
+// make installs hotbox as a symlink, so the module is beside the target.
 func LibraryPath() string {
 	exe, err := os.Executable()
 	if err != nil {
 		return ""
+	}
+	return libraryBeside(exe)
+}
+
+func libraryBeside(exe string) string {
+	if resolved, err := filepath.EvalSymlinks(exe); err == nil {
+		exe = resolved
 	}
 	ext := "so"
 	if runtime.GOOS == "darwin" {

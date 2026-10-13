@@ -10,9 +10,12 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/binary"
+	"fmt"
 	"math/big"
 	"net"
 	"os"
+	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -175,6 +178,42 @@ func testCert(t *testing.T) (*ecdsa.PrivateKey, []byte) {
 		t.Fatal(err)
 	}
 	return key, der
+}
+
+func TestLibraryBesideFollowsSymlink(t *testing.T) {
+	dir := t.TempDir()
+	bin := filepath.Join(dir, "dist", "hotbox")
+	if err := os.MkdirAll(filepath.Dir(bin), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(bin, []byte("x"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	ext := "so"
+	if runtime.GOOS == "darwin" {
+		ext = "dylib"
+	}
+	lib := filepath.Join(dir, "dist", fmt.Sprintf("libhotbox-pkcs11-%s-%s.%s", runtime.GOOS, runtime.GOARCH, ext))
+	if err := os.WriteFile(lib, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(dir, "bin", "hotbox")
+	if err := os.MkdirAll(filepath.Dir(link), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(bin, link); err != nil {
+		t.Fatal(err)
+	}
+	want, err := filepath.EvalSymlinks(lib)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := libraryBeside(link); got != want {
+		t.Fatalf("libraryBeside(symlink) = %q, want %q", got, want)
+	}
+	if got := libraryBeside(bin); got != want {
+		t.Fatalf("libraryBeside(binary) = %q, want %q", got, want)
+	}
 }
 
 func dial(t *testing.T, path string) net.Conn {
