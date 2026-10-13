@@ -15,7 +15,7 @@ func unlockPassword(label string) ([]byte, error) {
 	if !isatty.IsTerminal(os.Stdin.Fd()) {
 		return readPassword(os.Stdin)
 	}
-	text, err := ask("Password for "+label, "Unlocks this vault", true, required)
+	text, err := ask("Password for "+label, "Leave empty if this vault has no passphrase.", true, allowEmpty)
 	if err != nil {
 		return nil, err
 	}
@@ -24,6 +24,7 @@ func unlockPassword(label string) ([]byte, error) {
 
 // readPassword reads one password line. It does not buffer past that line,
 // so successive calls return the following lines and the scratch buffer is wiped.
+// An empty line is an empty passphrase.
 func readPassword(r io.Reader) ([]byte, error) {
 	var buf [maxPasswordLine + 1]byte
 	defer clear(buf[:])
@@ -51,7 +52,7 @@ func readPassword(r io.Reader) ([]byte, error) {
 		n--
 	}
 	if n == 0 {
-		return nil, errors.New("vault password is required")
+		return []byte{}, nil
 	}
 	out := make([]byte, n)
 	copy(out, buf[:n])

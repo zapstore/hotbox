@@ -250,6 +250,33 @@ func TestCreateNoAndroid(t *testing.T) {
 	}
 }
 
+func TestCreateEmptyPassword(t *testing.T) {
+	ctx := t.Context()
+	secret := testSecret(t)
+	dir := t.TempDir()
+	path := filepath.Join(dir, "zapstore.vault")
+	keys := filepath.Join(dir, "zapstore.key")
+	var connect [32]byte
+	var token [16]byte
+	connect[0] = 5
+	token[0] = 6
+	v, prof, err := profile.Create(ctx, path, keys, "zapstore", []byte{}, secret, connect, token, 10001, 10002, profile.AndroidKey{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := v.Close(); err != nil {
+		t.Fatal(err)
+	}
+	again, opened, err := profile.Open(ctx, path, keys, []byte{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer again.Close()
+	if opened.Npub == "" || opened.Npub != prof.Npub {
+		t.Fatalf("npub %s", opened.Npub)
+	}
+}
+
 func TestCreateNoKeyFile(t *testing.T) {
 	ctx := t.Context()
 	secret := testSecret(t)

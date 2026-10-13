@@ -50,6 +50,7 @@ func run() error {
 		fmt.Fprint(os.Stdout, `Usage:
   hotbox [--key file]
       Create a vault. Asks for a path, where to keep the key, an nsec, a password, and an optional Android keystore, prints the npub, then runs the bunker.
+      Leave the nsec empty to generate one. Leave the password empty for no passphrase.
   hotbox [--key file] <vault> [--key file] <vault> ...
       Unlock each vault and run a bunker for each.
       A vault is a file whose name ends in .hotbox. If you omit that suffix, it is added.
@@ -59,7 +60,8 @@ func run() error {
   hotbox sign <app-unsigned.apk>...
       Sign APKs with a running hotbox. See hotbox sign --help.
 
-The Nostr key is stored at profiles/<name>/nsec and marked secret. An Android
+The Nostr key is stored at profiles/<name>/nsec and marked secret. Leave the
+nsec prompt empty to generate one. A generated key is not printed. An Android
 keystore is optional. When one is given, the private key is stored at
 profiles/<name>/android-key and marked secret. Each signature decrypts a key
 only for that call. The keystore is read once, at creation; there is no
@@ -85,13 +87,16 @@ vault. If one is lost, create a new vault from your nsec.
 Connections and signature attempts are logged to stderr. The bunker URL and
 the private key are not logged.
 
-On a terminal, asks for each vault password. When stdin is not a terminal
+On a terminal, asks for each vault password. An empty password unlocks a
+vault that was created with an empty passphrase. When stdin is not a terminal
 (a pipe, or a service that passes passwords on stdin), reads one line per
-vault, in the same order as the paths.
+vault, in the same order as the paths. An empty line is an empty password.
 Creation prints the key, then one .env block: SIGN_WITH, plus HOTBOX_PIN
 and HOTBOX_SOCKET when the vault has an Android key. A key file prints its
-path. The keychain prints the key in hex. That hex is the backup, and
-xxd -r -p turns it into a key file for --key. Opening vaults prints the
+path. The keychain prints "Keychain value to back up" and the output of
+security find-generic-password -w. That hex is what to back up, and
+xxd -r -p turns it into a key file for --key. An empty passphrase with the
+keychain or a key file uses that secret alone. Opening vaults prints the
 .env block for each, prefixed with [name]. Paste a block into the project
 .env as is.
 The socket and the PKCS#11 config are /tmp/hotbox-<uid>/<name>.sock and
@@ -195,7 +200,7 @@ func createAndRun(ctx context.Context, log *slog.Logger, key string) error {
 	if err != nil {
 		return err
 	}
-	nsec, err := ask("Nostr private key", "nsec1… or 64-character hex. It is sealed inside the vault.", true, validNsec)
+	nsec, err := ask("Nostr private key", "nsec1… or 64-character hex. Leave empty to generate one. It is sealed inside the vault.", true, validNsec)
 	if err != nil {
 		return err
 	}
@@ -203,11 +208,21 @@ func createAndRun(ctx context.Context, log *slog.Logger, key string) error {
 	if err != nil {
 		return err
 	}
+	if password == "" && choice == noneChoice {
+		status("no passphrase and no key file; anyone with this vault can unlock it")
+	}
 	secret, err := secretFromInput(nsec)
 	if err != nil {
 		return err
 	}
 	defer clear(secret[:])
+	if nsec == "" {
+		npub, err := npubFromSecret(secret[:])
+		if err != nil {
+			return err
+		}
+		status("Generated a new Nostr key %s", npub)
+	}
 	pw := []byte(password)
 	defer clear(pw)
 	android, err := readAndroidKey()
@@ -367,26 +382,37 @@ func openAndRun(ctx context.Context, vaults []cliVault, log *slog.Logger) error 
 	return serve(running, true)
 }
 
-// reportKey prints the backup for the key paired with the passphrase.
-// A key file prints its path. The keychain prints the key in hex, which is
-// what `security find-generic-password -w` would return.
+// reportKey prints where to find the secret that opens the vault.
+// A key file prints its path. The keychain prints "Keychain value to back up"
+// and the same text `security find-generic-password -w` returns: the key in
+// hex, not the vault id.
 func reportKey(v *vaultcore.Vault) error {
+	line, err := keyReport(v)
+	if err != nil || line == "" {
+		return err
+	}
+	status("%s", line)
+	return nil
+}
+
+func keyReport(v *vaultcore.Vault) (string, error) {
 	stored := v.KeyStorage()
 	switch stored.Kind {
 	case vaultcore.KeyInFile:
-		status("key %s", stored.Location)
+		return "key " + stored.Location, nil
 	case vaultcore.KeyInKeychain:
 		raw, err := v.KeyCopy()
 		if err != nil || len(raw) == 0 {
 			if err == nil {
 				err = errors.New("key is empty")
 			}
-			return fmt.Errorf("read keychain key %s: %w", stored.Location, err)
+			return "", fmt.Errorf("read keychain key %s: %w", stored.Location, err)
 		}
 		defer clear(raw)
-		status("key %x", raw)
+		return "Keychain value to back up: " + hex.EncodeToString(raw), nil
+	default:
+		return "", nil
 	}
-	return nil
 }
 
 // envBlock is the .env text for one vault, printed once to stdout.
@@ -791,8 +817,12 @@ func claimPorts(used map[uint16]string, label string, ports ...uint16) error {
 }
 
 func secretFromInput(value string) ([32]byte, error) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return generateSecret()
+	}
 	var secret [32]byte
-	hexKey, err := decodeNsec(strings.TrimSpace(value))
+	hexKey, err := decodeNsec(value)
 	if err != nil {
 		return secret, err
 	}
@@ -844,7 +874,7 @@ func ask(title, description string, secret bool, validate func(string) error) (s
 }
 
 func askNewPassword() (string, error) {
-	password, err := ask("Vault password", "At least 12 characters", true, strongPassword)
+	password, err := ask("Vault password", "At least 12 characters, or leave empty.", true, strongPassword)
 	if err != nil {
 		return "", err
 	}
@@ -865,14 +895,51 @@ func required(value string) error {
 	return nil
 }
 
+func npubFromSecret(secret []byte) (string, error) {
+	if len(secret) != 32 {
+		return "", errors.New("invalid Nostr private key")
+	}
+	pub, err := nostr.GetPublicKey(hex.EncodeToString(secret))
+	if err != nil {
+		return "", fmt.Errorf("public key: %w", err)
+	}
+	npub, err := nip19.EncodePublicKey(pub)
+	if err != nil {
+		return "", fmt.Errorf("npub: %w", err)
+	}
+	return npub, nil
+}
+
+func generateSecret() ([32]byte, error) {
+	var secret [32]byte
+	hexKey := nostr.GeneratePrivateKey()
+	raw, err := hex.DecodeString(hexKey)
+	if err != nil || len(raw) != len(secret) {
+		clear(raw)
+		return secret, errors.New("could not generate a Nostr private key")
+	}
+	copy(secret[:], raw)
+	clear(raw)
+	if _, err := nostr.GetPublicKey(hexKey); err != nil {
+		clear(secret[:])
+		return [32]byte{}, errors.New("could not generate a Nostr private key")
+	}
+	return secret, nil
+}
+
 func validNsec(value string) error {
-	_, err := decodeNsec(strings.TrimSpace(value))
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return nil
+	}
+	_, err := decodeNsec(value)
 	return err
 }
 
 func strongPassword(value string) error {
-	if err := required(value); err != nil {
-		return err
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return nil
 	}
 	if len(value) < 12 {
 		return errors.New("use at least 12 characters")

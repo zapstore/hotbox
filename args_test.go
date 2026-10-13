@@ -1,11 +1,17 @@
 package main
 
 import (
+	"bytes"
+	"encoding/hex"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
 
+	nostr "github.com/nbd-wtf/go-nostr"
+	"github.com/nbd-wtf/go-nostr/nip19"
+	"github.com/zapstore/hotbox/profile"
 	"vaultcore/vault"
 )
 
@@ -36,6 +42,53 @@ func TestParseArgs(t *testing.T) {
 	}
 	if _, _, _, err := parseArgs([]string{"a", "--key", "/tmp/a.key"}); err == nil {
 		t.Fatal("accepted a trailing --key")
+	}
+}
+
+func TestSecretFromInput(t *testing.T) {
+	if err := validNsec(""); err != nil {
+		t.Fatal(err)
+	}
+	if err := validNsec("nope"); err == nil {
+		t.Fatal("accepted an invalid nsec")
+	}
+	first, err := secretFromInput("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { clear(first[:]) })
+	second, err := secretFromInput("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { clear(second[:]) })
+	if first == ([32]byte{}) || first == second {
+		t.Fatal("generated key is empty or repeated")
+	}
+	npub, err := npubFromSecret(first[:])
+	if err != nil {
+		t.Fatal(err)
+	}
+	prefix, decoded, err := nip19.Decode(npub)
+	if err != nil || prefix != "npub" {
+		t.Fatalf("npub %s prefix %s err %v", npub, prefix, err)
+	}
+	pub, err := nostr.GetPublicKey(hex.EncodeToString(first[:]))
+	if err != nil || decoded != pub {
+		t.Fatalf("npub %s decoded %v pub %s err %v", npub, decoded, pub, err)
+	}
+	hexKey := nostr.GeneratePrivateKey()
+	got, err := secretFromInput(hexKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { clear(got[:]) })
+	raw, err := hex.DecodeString(hexKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got[:], raw) {
+		t.Fatal("did not keep the given key")
 	}
 }
 
@@ -176,6 +229,78 @@ func TestEnvBlock(t *testing.T) {
 	}
 	if got := envBlock("releases", true, "bunker://abc", "pin", "/tmp/hotbox.sock"); got != "[releases]\n"+android {
 		t.Fatalf("open %q", got)
+	}
+}
+
+func TestKeychainEmptyPassphraseBackup(t *testing.T) {
+	if !vaultcore.KeychainSupported() {
+		t.Skip("keychain is only supported on macOS")
+	}
+	dir := t.TempDir()
+	kc := filepath.Join(dir, "test.keychain-db")
+	for _, args := range [][]string{
+		{"create-keychain", "-p", "", kc},
+		{"set-keychain-settings", kc},
+		{"unlock-keychain", "-p", "", kc},
+	} {
+		out, err := exec.Command("/usr/bin/security", args...).CombinedOutput()
+		if err != nil {
+			t.Fatalf("security %v: %s", args, out)
+		}
+	}
+	t.Cleanup(func() {
+		_ = exec.Command("/usr/bin/security", "delete-keychain", kc).Run()
+	})
+	t.Setenv("VAULTCORE_KEYCHAIN", kc)
+
+	ctx := t.Context()
+	secret, err := secretFromInput("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { clear(secret[:]) })
+	var connect [32]byte
+	var token [16]byte
+	connect[0] = 7
+	token[0] = 8
+	path := filepath.Join(dir, "zapstore.hotbox")
+	v, prof, err := profile.Create(ctx, path, "", "zapstore", []byte{}, secret[:], connect, token, 10001, 10002, profile.AndroidKey{}, vaultcore.Keychain())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if prof.Npub == "" {
+		t.Fatal("missing npub")
+	}
+	line, err := keyReport(v)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stored := v.KeyStorage()
+	account := strings.TrimPrefix(stored.Location, vaultcore.KeychainService+"/")
+	if account == "" || account == stored.Location {
+		t.Fatalf("storage %+v", stored)
+	}
+	out, err := exec.Command("/usr/bin/security", "find-generic-password", "-s", vaultcore.KeychainService, "-a", account, "-w", kc).Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "Keychain value to back up: " + strings.TrimSpace(string(out))
+	if line != want {
+		t.Fatalf("line %q want %q", line, want)
+	}
+	if strings.Contains(line, account) {
+		t.Fatalf("backup line contains the vault id %s", account)
+	}
+	if err := v.Close(); err != nil {
+		t.Fatal(err)
+	}
+	again, opened, err := profile.Open(ctx, path, "", []byte{}, vaultcore.Keychain())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer again.Close()
+	if opened.Npub != prof.Npub || again.KeyStorage().Kind != vaultcore.KeyInKeychain {
+		t.Fatalf("reopen npub=%s kind=%s", opened.Npub, again.KeyStorage().Kind)
 	}
 }
 
