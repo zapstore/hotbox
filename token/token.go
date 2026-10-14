@@ -3,6 +3,7 @@
 package token
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"crypto/subtle"
@@ -465,27 +466,60 @@ func wipe(b []byte) {
 	runtime.KeepAlive(b)
 }
 
-// LibraryPath is the PKCS#11 module next to this executable, when it exists.
-// make installs hotbox as a symlink, so the module is beside the target.
-func LibraryPath() string {
-	exe, err := os.Executable()
-	if err != nil {
-		return ""
+// LibraryPath writes the embedded PKCS#11 module into the signer directory
+// and returns that path. An empty module returns an empty path. SunPKCS11
+// dlopens the file; the hotbox binary is what gets shipped.
+func LibraryPath() (string, error) {
+	if len(pkcs11Module) == 0 {
+		return "", nil
 	}
-	return libraryBeside(exe)
-}
-
-func libraryBeside(exe string) string {
-	if resolved, err := filepath.EvalSymlinks(exe); err == nil {
-		exe = resolved
+	dir, err := socketDir()
+	if err != nil {
+		return "", err
 	}
 	ext := "so"
 	if runtime.GOOS == "darwin" {
 		ext = "dylib"
 	}
-	path := filepath.Join(filepath.Dir(exe), fmt.Sprintf("libhotbox-pkcs11-%s-%s.%s", runtime.GOOS, runtime.GOARCH, ext))
-	if _, err := os.Stat(path); err != nil {
-		return ""
+	path := filepath.Join(dir, "libhotbox-pkcs11."+ext)
+	if existing, err := os.ReadFile(path); err == nil && bytes.Equal(existing, pkcs11Module) {
+		if err := os.Chmod(path, 0700); err != nil {
+			return "", fmt.Errorf("write pkcs11 module: %w", err)
+		}
+		return path, nil
 	}
-	return path
+	if err := writeModule(dir, path, pkcs11Module); err != nil {
+		return "", fmt.Errorf("write pkcs11 module: %w", err)
+	}
+	return path, nil
+}
+
+func writeModule(dir, path string, mod []byte) error {
+	tmp, err := os.CreateTemp(dir, ".libhotbox-pkcs11-*")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	ok := false
+	defer func() {
+		if !ok {
+			_ = os.Remove(tmpName)
+		}
+	}()
+	if err := tmp.Chmod(0700); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if _, err := tmp.Write(mod); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(tmpName, path); err != nil {
+		return err
+	}
+	ok = true
+	return nil
 }

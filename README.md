@@ -62,7 +62,7 @@ SIGN_WITH='bunker://…'
 
 Paste the `SIGN_WITH` lines into the project `.env`, and `HOTBOX_PIN` and `HOTBOX_SOCKET` when they are present. Anyone who can read that file can sign as you while hotbox is unlocked, so keep it mode 0600 and out of git. `hotbox sign` and `zsp` refuse a `.env` that other users can read. Stopping hotbox stops all signing.
 
-`make` also builds `dist/libhotbox-pkcs11-<os>-<arch>.dylib` (or `.so`) next to the binary. apksigner loads that module. The module forwards each signature to the socket. It never receives the private key. The key alias is `hotbox`.
+The PKCS#11 module is compiled into the hotbox binary. When a vault with an Android key opens, hotbox writes it to `/tmp/hotbox-<uid>/libhotbox-pkcs11.dylib` (or `.so`). apksigner loads that file. The module forwards each signature to the socket. It never receives the private key. The key alias is `hotbox`.
 
 `hotbox sign` signs APKs through that module. It reads `HOTBOX_SOCKET` and `HOTBOX_PIN` from the environment, then from `.env` in the current directory, and finds `zipalign` and `apksigner` on `PATH` or under `$ANDROID_HOME`. An input named `app-release-unsigned.apk` is written as `app-release.apk` beside it. Any other name is written as `<name>-signed.apk`. It verifies the output and prints its path and certificate digest.
 

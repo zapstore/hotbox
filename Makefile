@@ -11,16 +11,16 @@ GOOS ?= $(shell go env GOOS)
 GOARCH ?= $(shell go env GOARCH)
 BIN := dist/$(NAME)-$(GOOS)-$(GOARCH)
 
+# Compiled before go build and embedded. Not a dist artifact.
+MODULE := token/pkcs11.module
+
 ifeq ($(GOOS),darwin)
-PKCS11 := dist/libhotbox-pkcs11-$(GOOS)-$(GOARCH).dylib
 PKCS11_CC := cc
-PKCS11_CFLAGS := -dynamiclib -O2 -Wall -Wextra -Wno-cast-function-type-mismatch
+PKCS11_CFLAGS := -dynamiclib -O2 -Wall -Wextra -Wno-cast-function-type-mismatch -Wl,-install_name,@rpath/libhotbox-pkcs11.dylib
 else ifeq ($(GOARCH),arm64)
-PKCS11 := dist/libhotbox-pkcs11-$(GOOS)-$(GOARCH).so
 PKCS11_CC := zig cc -target aarch64-linux-gnu
 PKCS11_CFLAGS := -shared -fPIC -O2 -Wall -Wextra -Wno-cast-function-type-mismatch
 else
-PKCS11 := dist/libhotbox-pkcs11-$(GOOS)-$(GOARCH).so
 PKCS11_CC := zig cc -target x86_64-linux-gnu
 PKCS11_CFLAGS := -shared -fPIC -O2 -Wall -Wextra -Wno-cast-function-type-mismatch
 endif
@@ -36,16 +36,20 @@ all: bin
 
 # Fast suite: weak Argon2id so each unlock is cheap. Never used for a binary.
 test:
+	rm -f $(MODULE)
+	$(PKCS11_CC) $(PKCS11_CFLAGS) -o $(MODULE) pkcs11/hotbox.c
 	go vet -tags vaultcore_weakkdf ./...
 	go test -tags vaultcore_weakkdf -count=1 ./...
 
 bin:
 	mkdir -p dist
-	rm -rf $(BIN) $(PKCS11)
+	rm -f $(BIN) $(MODULE) \
+		dist/libhotbox-pkcs11-$(GOOS)-$(GOARCH).dylib \
+		dist/libhotbox-pkcs11-$(GOOS)-$(GOARCH).so
+	$(PKCS11_CC) $(PKCS11_CFLAGS) -o $(MODULE) pkcs11/hotbox.c
 	CGO_ENABLED=$(CGO_ENABLED) GOOS=$(GOOS) GOARCH=$(GOARCH) \
 		go build $(GOFLAGS) -ldflags '$(LDFLAGS)' \
 		-o $(BIN) $(CMD)
-	$(PKCS11_CC) $(PKCS11_CFLAGS) -o $(PKCS11) pkcs11/hotbox.c
 ifeq ($(GOOS)-$(GOARCH),$(HOST_OS)-$(HOST_ARCH))
 	mkdir -p $(LOCAL_BIN)
 	ln -sfn $(abspath $(BIN)) $(LOCAL_BIN)/$(NAME)
@@ -66,4 +70,4 @@ linux-amd64:
 
 clean:
 	rm -rf dist
-	rm -f $(NAME)
+	rm -f $(NAME) $(MODULE)

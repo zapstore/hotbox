@@ -101,7 +101,9 @@ keychain or a key file uses that secret alone. Opening vaults prints the
 .env as is.
 The socket and the PKCS#11 config are /tmp/hotbox-<uid>/<name>.sock and
 .pkcs11.cfg, and they stay the same across runs. The key alias is always hotbox.
-The PKCS#11 module asks hotbox to sign and never receives the private key.
+The PKCS#11 module is inside this binary. Hotbox writes it beside the socket
+so apksigner can load it. The module asks hotbox to sign and never receives
+the private key.
 The socket also signs NIP-C1 certificate proofs, only for the vault's npub.
 Under systemd Type=notify, signals ready after every vault is listening.
 
@@ -453,7 +455,7 @@ func serve(running []signer, prefix bool) error {
 		}
 		fmt.Print(envBlock(s.label, prefix, s.bunker.URL(), pin, socket))
 		if s.token != nil && s.token.Config == "" {
-			status("pkcs11 module is not next to the hotbox binary; rebuild with make")
+			status("this hotbox binary has no pkcs11 module; rebuild with make")
 		}
 	}
 	if err := notifyReady(); err != nil {
@@ -483,13 +485,17 @@ func startToken(ctx context.Context, prof profile.Profile, log *slog.Logger) (*t
 	if err != nil || prefix != "npub" || !ok {
 		return nil, errors.New("profile npub is invalid")
 	}
+	lib, err := token.LibraryPath()
+	if err != nil {
+		return nil, err
+	}
 	return token.Start(ctx, prof.Name, token.Key{
 		Alias:  prof.Android.Alias,
 		PIN:    prof.Android.PIN,
 		Certs:  prof.Android.Certs,
 		Pubkey: pubkey,
 		Use:    prof.Android.Use,
-	}, token.LibraryPath(), log)
+	}, lib, log)
 }
 
 func readAndroidKey() (profile.AndroidKey, error) {

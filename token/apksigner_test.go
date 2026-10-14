@@ -27,7 +27,13 @@ func TestApksigner(t *testing.T) {
 			t.Skip("apksigner not installed")
 		}
 	}
-	lib := buildModule(t)
+	lib, err := LibraryPath()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if lib == "" {
+		t.Fatal("pkcs11 module is not embedded")
+	}
 	_, file, _, ok := runtime.Caller(0)
 	if !ok {
 		t.Fatal("caller")
@@ -98,28 +104,4 @@ func TestApksigner(t *testing.T) {
 	if output, err := verify.CombinedOutput(); err != nil {
 		t.Fatalf("apksigner verify: %v\n%s", err, output)
 	}
-}
-
-func buildModule(t *testing.T) string {
-	t.Helper()
-	cc, err := exec.LookPath("cc")
-	if err != nil {
-		t.Skip("cc not installed")
-	}
-	_, file, _, ok := runtime.Caller(0)
-	if !ok {
-		t.Fatal("caller")
-	}
-	src := filepath.Join(filepath.Dir(file), "..", "pkcs11", "hotbox.c")
-	out := filepath.Join(t.TempDir(), "libhotbox-pkcs11.dylib")
-	flags := []string{"-dynamiclib", "-O2", "-Wall", "-Wextra", "-Wno-cast-function-type-mismatch", "-o", out, src}
-	if runtime.GOOS != "darwin" {
-		out = filepath.Join(t.TempDir(), "libhotbox-pkcs11.so")
-		flags = []string{"-shared", "-fPIC", "-O2", "-Wall", "-Wextra", "-Wno-cast-function-type-mismatch", "-o", out, src}
-	}
-	cmd := exec.Command(cc, flags...)
-	if output, err := cmd.CombinedOutput(); err != nil {
-		t.Fatalf("compile pkcs11: %v\n%s", err, output)
-	}
-	return out
 }
