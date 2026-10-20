@@ -119,8 +119,9 @@ func Create(ctx context.Context, path, keyFile, name string, password, secret []
 
 // Open unlocks a container and loads its single profile.
 // A new vault is one file. A directory container from an older hotbox still opens.
-// The caller must close the vault. A second open while this one is held
-// returns vaultcore.ErrBusy.
+// The caller must close the vault. A second writer gets vaultcore.ErrBusy.
+// When the nsec or Android key blob is gone, Open returns vaultcore.ErrMissing
+// and names that path. It leaves the entry in place.
 func Open(ctx context.Context, path, keyFile string, password []byte, opts ...vaultcore.Option) (*vaultcore.Vault, Profile, error) {
 	v, err := vaultcore.Open(ctx, path, keyFile, password, opts...)
 	if err != nil {
@@ -149,6 +150,9 @@ func load(ctx context.Context, v *vaultcore.Vault, name string) (Profile, error)
 	}
 	alias, pin, certs, err := readAndroid(ctx, v, name)
 	if err != nil {
+		return Profile{}, err
+	}
+	if err := refuseMissingKeys(ctx, v, name, certs != nil); err != nil {
 		return Profile{}, err
 	}
 	var gate sync.Mutex
@@ -191,6 +195,37 @@ func load(ctx context.Context, v *vaultcore.Vault, name string) (Profile, error)
 		return Profile{}, err
 	}
 	return p, nil
+}
+
+// refuseMissingKeys reports secret profile paths whose blob is not on disk.
+// Other missing entries stay as they are. Repair would delete the key, so this does not call it.
+func refuseMissingKeys(ctx context.Context, v *vaultcore.Vault, name string, android bool) error {
+	st, err := v.Status(ctx)
+	if err != nil {
+		return err
+	}
+	if st.Missing == 0 {
+		return nil
+	}
+	paths := []string{nsecPath(name)}
+	if android {
+		paths = append(paths, androidKeyPath(name))
+	}
+	var gone []string
+	for _, path := range paths {
+		err := v.Use(ctx, path, func([]byte) error { return nil })
+		if errors.Is(err, vaultcore.ErrMissing) {
+			gone = append(gone, path)
+			continue
+		}
+		if err != nil {
+			return err
+		}
+	}
+	if len(gone) == 0 {
+		return nil
+	}
+	return fmt.Errorf("%s: %w", strings.Join(gone, ", "), vaultcore.ErrMissing)
 }
 
 func confirmSecret(v *vaultcore.Vault, name string) error {
