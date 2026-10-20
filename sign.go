@@ -52,7 +52,7 @@ func runSign(args []string) error {
 		if err != nil {
 			return fmt.Errorf("%s: %w", apk, err)
 		}
-		fmt.Printf("%s\n  certificate SHA-256 %s\n", out, digest)
+		fmt.Printf("%s\n  certificate SHA-256 %s\n", displayPath(out), digest)
 	}
 	return nil
 }
@@ -197,6 +197,25 @@ func compareVersions(a, b string) int {
 func executable(path string) bool {
 	info, err := os.Stat(path)
 	return err == nil && !info.IsDir() && info.Mode()&0o111 != 0
+}
+
+// displayPath drops the working-directory prefix when the path is inside it.
+// Abs and Getwd use the same logical path, so a symlink such as macOS /var
+// is not rewritten out from under the comparison.
+func displayPath(path string) string {
+	absolute, err := filepath.Abs(path)
+	if err != nil {
+		return path
+	}
+	working, err := os.Getwd()
+	if err != nil {
+		return absolute
+	}
+	relative, err := filepath.Rel(working, absolute)
+	if err != nil || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
+		return absolute
+	}
+	return relative
 }
 
 // signOutput names the signed APK beside the input.
