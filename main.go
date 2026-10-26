@@ -16,6 +16,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime"
+	"runtime/debug"
 	"strings"
 	"syscall"
 
@@ -31,6 +32,9 @@ import (
 	"vaultcore/vault"
 )
 
+// version is the build ref. The Makefile sets it with -X main.version only when HEAD is exactly a git tag.
+var version = "dev"
+
 func main() {
 	if err := run(); err != nil {
 		fmt.Fprintln(os.Stderr, "hotbox:", err)
@@ -41,6 +45,10 @@ func main() {
 func run() error {
 	if len(os.Args) > 1 && os.Args[1] == "sign" {
 		return runSign(os.Args[2:])
+	}
+	if versionRequested(os.Args[1:]) {
+		fmt.Println(buildVersion())
+		return nil
 	}
 	vaults, createKey, help, err := parseArgs(os.Args[1:])
 	if err != nil {
@@ -59,6 +67,8 @@ func run() error {
       A vault named sign must be given as ./sign.
   hotbox sign <app-unsigned.apk>...
       Sign APKs with a running hotbox. See hotbox sign --help.
+  hotbox --version
+      Print the version. A build from a tag prints that tag. Any other build prints dev.
 
 The Nostr key is stored at profiles/<name>/nsec and marked secret. Leave the
 nsec prompt empty to generate one. A generated key is not printed. An Android
@@ -135,6 +145,20 @@ The Android signer listens on a Unix socket in /tmp and accepts only this user.
 type cliVault struct {
 	arg string
 	key string
+}
+
+func versionRequested(args []string) bool {
+	return len(args) > 0 && args[0] == "--version"
+}
+
+func buildVersion() string {
+	if version != "dev" {
+		return version
+	}
+	if info, ok := debug.ReadBuildInfo(); ok && info.Main.Version != "" && info.Main.Version != "(devel)" {
+		return info.Main.Version
+	}
+	return version
 }
 
 func parseArgs(args []string) (vaults []cliVault, createKey string, help bool, err error) {

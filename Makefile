@@ -7,6 +7,12 @@ CGO_ENABLED ?= 0
 GOFLAGS := -trimpath
 LDFLAGS := -s -w
 
+# Stamp main.version only when HEAD is exactly a git tag.
+VERSION := $(shell git describe --tags --exact-match HEAD 2>/dev/null)
+ifneq ($(VERSION),)
+LDFLAGS += -X main.version=$(VERSION)
+endif
+
 GOOS ?= $(shell go env GOOS)
 GOARCH ?= $(shell go env GOARCH)
 BIN := dist/$(NAME)-$(GOOS)-$(GOARCH)

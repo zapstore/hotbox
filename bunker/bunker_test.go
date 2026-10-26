@@ -160,6 +160,27 @@ func TestPlainEventIsLogged(t *testing.T) {
 	}
 }
 
+func TestBrowserOriginOnLoopback(t *testing.T) {
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+	b := start(t, ctx, testKey(t), nil)
+	defer b.Close()
+	ws, _ := splitRelays(t, b.URL(), b.WSS())
+	for origin, ok := range map[string]bool{
+		"http://127.0.0.1:8080": true,
+		"http://localhost:3000": true,
+		"https://example.com":   false,
+	} {
+		conn, _, err := websocket.Dial(ctx, ws, &websocket.DialOptions{HTTPHeader: http.Header{"Origin": {origin}}})
+		if (err == nil) != ok {
+			t.Fatalf("origin %s: err = %v", origin, err)
+		}
+		if conn != nil {
+			conn.Close(websocket.StatusNormalClosure, "")
+		}
+	}
+}
+
 func TestWSSHandshake(t *testing.T) {
 	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
 	defer cancel()

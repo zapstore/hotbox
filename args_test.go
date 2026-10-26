@@ -15,6 +15,15 @@ import (
 	"vaultcore/vault"
 )
 
+func TestVersionRequested(t *testing.T) {
+	if !versionRequested([]string{"--version"}) || !versionRequested([]string{"--version", "extra"}) {
+		t.Fatal("expected --version as the first argument")
+	}
+	if versionRequested(nil) || versionRequested([]string{"--help"}) || versionRequested([]string{"vault", "--version"}) {
+		t.Fatal("version flag only leads the arguments")
+	}
+}
+
 func TestParseArgs(t *testing.T) {
 	vaults, createKey, help, err := parseArgs([]string{"/tmp/a.vault", "/tmp/b.vault"})
 	if err != nil {

@@ -223,6 +223,10 @@ func newServer(ctx context.Context, handler http.Handler) *http.Server {
 	}
 }
 
+// loopbackOrigins lets a page served from this computer, on any port, open the bunker.
+// Other web origins are refused.
+var loopbackOrigins = []string{"127.0.0.1", "127.0.0.1:*", "localhost", "localhost:*", "[::1]", "[::1]:*"}
+
 func relayURL(scheme string, addr net.Addr, token string) string {
 	return (&url.URL{Scheme: scheme, Host: addr.String(), Path: "/" + token}).String()
 }
@@ -235,7 +239,7 @@ func bunkerURL(pubkey, secret, relay string) string {
 }
 
 func (b *Bunker) serveWS(w http.ResponseWriter, r *http.Request) {
-	connection, err := websocket.Accept(w, r, nil)
+	connection, err := websocket.Accept(w, r, &websocket.AcceptOptions{OriginPatterns: loopbackOrigins})
 	if err != nil {
 		return
 	}
