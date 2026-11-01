@@ -12,6 +12,14 @@ VERSION := $(shell git describe --tags --exact-match HEAD 2>/dev/null)
 ifneq ($(VERSION),)
 LDFLAGS += -X main.version=$(VERSION)
 endif
+# v0.1.0 -> 0.1.0. Release asset names use this.
+RELVER := $(patsubst v%,%,$(VERSION))
+
+ifneq ($(filter release,$(MAKECMDGOALS)),)
+ifeq ($(VERSION),)
+$(error HEAD is not exactly a git tag; tag this commit, then run make release)
+endif
+endif
 
 GOOS ?= $(shell go env GOOS)
 GOARCH ?= $(shell go env GOARCH)
@@ -35,7 +43,7 @@ HOST_OS := $(shell go env GOOS)
 HOST_ARCH := $(shell go env GOARCH)
 LOCAL_BIN := $(HOME)/.local/bin
 
-.PHONY: all bin test darwin-arm64 linux-arm64 linux-amd64 clean
+.PHONY: all bin test darwin-arm64 linux-arm64 linux-amd64 release clean
 
 all: bin
 	ln -sfn $(BIN) $(NAME)
@@ -73,6 +81,19 @@ linux-amd64:
 	$(MAKE) bin GOOS=linux GOARCH=amd64 \
 		CC="zig cc -target x86_64-linux-gnu" \
 		CXX="zig c++ -target x86_64-linux-gnu"
+
+# Three binaries in dist/. Does not create the tag or the GitHub release.
+release:
+	$(MAKE) darwin-arm64
+	$(MAKE) linux-arm64
+	$(MAKE) linux-amd64
+	cp dist/$(NAME)-darwin-arm64 dist/$(NAME)-$(RELVER)-darwin-arm64
+	cp dist/$(NAME)-linux-arm64 dist/$(NAME)-$(RELVER)-linux-arm64
+	cp dist/$(NAME)-linux-amd64 dist/$(NAME)-$(RELVER)-linux-amd64
+	dist/$(NAME)-$(HOST_OS)-$(HOST_ARCH) --version | grep -qx "$(VERSION)"
+	@echo dist/$(NAME)-$(RELVER)-darwin-arm64
+	@echo dist/$(NAME)-$(RELVER)-linux-arm64
+	@echo dist/$(NAME)-$(RELVER)-linux-amd64
 
 clean:
 	rm -rf dist
