@@ -37,8 +37,10 @@ var errMechanism = errors.New("mechanism rejected")
 const (
 	// proofSkew is how far a proof's created_at may be from this clock.
 	proofSkew = 5 * time.Minute
+	// proofDefaultLife matches zsp/internal/identity.DefaultExpiry.
+	proofDefaultLife = 2 * 365 * 24 * time.Hour
 	// proofMaxLife bounds a proof's validity. It matches the zsp default plus a day.
-	proofMaxLife = (2*365 + 1) * 24 * time.Hour
+	proofMaxLife = proofDefaultLife + 24*time.Hour
 )
 
 // proofMessage is the NIP-C1 certificate-signed message.

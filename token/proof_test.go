@@ -46,7 +46,7 @@ func TestProofOverSocket(t *testing.T) {
 		expiry    int64
 		status    byte
 	}{
-		{"valid", string(pin[:]), now, now + 365*24*3600, statusOK},
+		{"valid", string(pin[:]), now, now + 2*365*24*3600, statusOK},
 		{"wrong pin", "00000000000000000000000000000000", now, now + 3600, statusPIN},
 		{"old created_at", string(pin[:]), now - 3600, now + 3600, statusBad},
 		{"expiry before created_at", string(pin[:]), now, now - 1, statusBad},

@@ -28,6 +28,7 @@ import (
 	"github.com/coder/websocket"
 	"github.com/coder/websocket/wsjson"
 	gonostr "github.com/nbd-wtf/go-nostr"
+	"github.com/nbd-wtf/go-nostr/nip44"
 	"github.com/nbd-wtf/go-nostr/nip46"
 )
 
@@ -376,9 +377,14 @@ func (b *Bunker) accept(ctx context.Context, event gonostr.Event) (gonostr.Event
 
 func (b *Bunker) dispatch(ctx context.Context, clientPub string, request nip46.Request) (string, error) {
 	b.mu.Lock()
-	if request.Method == "sign_event" {
+	// These take b.mu themselves through useKey.
+	switch request.Method {
+	case "sign_event":
 		b.mu.Unlock()
 		return b.signRequested(ctx, clientPub, request)
+	case "nip44_decrypt":
+		b.mu.Unlock()
+		return b.decryptRequested(ctx, clientPub, request)
 	}
 	defer b.mu.Unlock()
 	switch request.Method {
@@ -484,6 +490,35 @@ func (b *Bunker) signRequested(ctx context.Context, clientPub string, request ni
 		return "", err
 	}
 	return string(encoded), nil
+}
+
+// decryptRequested answers nip44_decrypt: params are the sender's public key
+// and the NIP-44 payload. It is how a NIP-17 inbox opens a gift wrap and its
+// seal. The plaintext is returned to the client and is never logged.
+func (b *Bunker) decryptRequested(ctx context.Context, clientPub string, request nip46.Request) (string, error) {
+	if len(request.Params) != 2 {
+		err := errors.New("nip44_decrypt requires a public key and a payload")
+		b.warn("decrypt", "client", clientPub, "result", "rejected", "err", err.Error())
+		return "", err
+	}
+	var conversation [32]byte
+	err := b.useKey(ctx, func(key []byte) error {
+		var keyErr error
+		conversation, keyErr = nip44Conversation(request.Params[0], key)
+		return keyErr
+	})
+	defer wipe32(&conversation)
+	if err != nil {
+		b.warn("decrypt", "client", clientPub, "result", "rejected", "err", err.Error())
+		return "", errors.New("invalid public key")
+	}
+	plain, err := nip44.Decrypt(request.Params[1], conversation)
+	if err != nil {
+		b.warn("decrypt", "client", clientPub, "result", "rejected", "err", err.Error())
+		return "", errors.New("decrypt failed")
+	}
+	b.info("decrypt", "client", clientPub, "result", "decrypted")
+	return plain, nil
 }
 
 func (b *Bunker) useKey(ctx context.Context, fn func(key []byte) error) error {

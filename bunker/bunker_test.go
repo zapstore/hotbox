@@ -19,6 +19,7 @@ import (
 
 	"github.com/coder/websocket"
 	gonostr "github.com/nbd-wtf/go-nostr"
+	"github.com/nbd-wtf/go-nostr/nip44"
 	"github.com/nbd-wtf/go-nostr/nip46"
 )
 
@@ -117,6 +118,59 @@ func TestBunkerSignsOnLocalRelays(t *testing.T) {
 	}
 	if strings.Contains(text, hex.EncodeToString(secret[:])) || strings.Contains(text, "bunker://") {
 		t.Fatal("log contains key material or the bunker URL")
+	}
+}
+
+func TestNIP44Decrypt(t *testing.T) {
+	ctx, cancel := context.WithTimeout(t.Context(), 20*time.Second)
+	defer cancel()
+	logged := &lockedBuffer{}
+	b := start(t, ctx, testKey(t), slog.New(slog.NewTextHandler(logged, nil)))
+	defer b.Close()
+	client, err := nip46.ConnectBunker(ctx, gonostr.GeneratePrivateKey(), b.URL(), nil, func(string) {})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	sender := gonostr.GeneratePrivateKey()
+	senderPub, err := gonostr.GetPublicKey(sender)
+	if err != nil {
+		t.Fatal(err)
+	}
+	conversation, err := nip44.GenerateConversationKey(b.PublicKey(), sender)
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload, err := nip44.Encrypt("secret-report", conversation)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := client.NIP44Decrypt(ctx, senderPub, payload)
+	if err != nil || got != "secret-report" {
+		t.Fatalf("decrypt = %q, %v", got, err)
+	}
+
+	otherPub, err := gonostr.GetPublicKey(gonostr.GeneratePrivateKey())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, args := range map[string][2]string{
+		"wrong sender":   {otherPub, payload},
+		"bad public key": {"zz", payload},
+		"bad payload":    {senderPub, strings.Repeat("A", 200)},
+	} {
+		if _, err := client.NIP44Decrypt(ctx, args[0], args[1]); err == nil {
+			t.Fatalf("%s: decrypted", name)
+		}
+	}
+
+	text := logged.String()
+	if !strings.Contains(text, "msg=decrypt") || !strings.Contains(text, "result=decrypted") {
+		t.Fatalf("log = %s", text)
+	}
+	if strings.Contains(text, "secret-report") {
+		t.Fatal("log contains the plaintext")
 	}
 }
 
