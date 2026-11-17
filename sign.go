@@ -29,6 +29,11 @@ name is written as <name>-signed.apk. An existing output is replaced.
 
 Requires zipalign and apksigner from Android build-tools, on PATH or under
 $ANDROID_HOME. Hotbox never reads the APK; apksigner asks it to sign.
+
+The APK must already be zipaligned (zipalign -c -p 4); AGP's output is. It is
+signed with the v2 and v3 schemes only (no v1 JAR signature, so minSdk 24 or
+later) and apksigner keeps its alignment, so the signed file is the unsigned
+one plus a signing block and nothing else.
 `
 
 func runSign(args []string) error {
@@ -244,16 +249,11 @@ func signAPK(tools buildTools, env hotboxEnv, apk string) (out, digest string, e
 	if err != nil {
 		return "", "", err
 	}
-	aligned, err := os.CreateTemp(filepath.Dir(in), ".hotbox-align-*.apk")
-	if err != nil {
-		return "", "", err
-	}
-	alignedPath := aligned.Name()
-	_ = aligned.Close()
-	defer os.Remove(alignedPath)
-
-	if output, err := exec.Command(tools.zipalign, "-f", "-p", "4", in, alignedPath).CombinedOutput(); err != nil {
-		return "", "", fmt.Errorf("zipalign: %w\n%s", err, strings.TrimSpace(string(output)))
+	// apksigner is told to keep the APK exactly as it is, apart from adding the signature. That is what lets
+	// anyone rebuild the APK from source and reproduce this file's digest by adding the same signature to
+	// their copy. So the APK must already be aligned; AGP aligns its output.
+	if output, err := exec.Command(tools.zipalign, "-c", "-p", "4", in).CombinedOutput(); err != nil {
+		return "", "", fmt.Errorf("the APK is not zipaligned (zipalign -c -p 4); build it with AGP, or align it first\n%s", strings.TrimSpace(string(output)))
 	}
 	// The apksigner wrapper takes -J options before the subcommand and adds one leading dash.
 	sign := exec.Command(tools.apksigner,
@@ -265,7 +265,9 @@ func signAPK(tools buildTools, env hotboxEnv, apk string) (out, digest string, e
 		"--ks-type", "PKCS11",
 		"--ks-key-alias", profile.AndroidAlias,
 		"--ks-pass", "env:HOTBOX_PIN",
-		"--in", alignedPath,
+		"--alignment-preserved",
+		"--v1-signing-enabled", "false",
+		"--in", in,
 		"--out", out,
 	)
 	sign.Env = append(os.Environ(), "HOTBOX_TOKEN="+env.socket, "HOTBOX_PIN="+env.pin)
