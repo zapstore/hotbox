@@ -9,6 +9,7 @@ While it is unlocked:
 - zsp, and any other NIP-46 client, signs with the bunker URL printed at startup.
 - `hotbox sign` signs APKs through apksigner. The private key stays in the vault.
 - zsp can ask the same process for a NIP-C1 certificate proof when a release needs one.
+- A NIP-46 client can send `nip44_decrypt` to open a message encrypted to this vault's npub, such as a NIP-17 gift wrap. The plaintext goes back to that client. It is never logged.
 
 Stop hotbox and both kinds of signing stop. With the second secret in the macOS keychain or a key file, a copy of the vault is not enough to start it again.
 
@@ -107,7 +108,7 @@ The bunker URL and the PIN go to stdout. Connections and signature attempts, inc
 hotbox sign app/build/outputs/apk/release/app-release-unsigned.apk
 ```
 
-`hotbox sign` reads `HOTBOX_SOCKET` and `HOTBOX_PIN` from the environment, then from `.env` in the current directory. It finds `zipalign` and `apksigner` on `PATH` or under `$ANDROID_HOME`.
+`hotbox sign` reads `HOTBOX_SOCKET` and `HOTBOX_PIN` from the environment, then from `.env` in the current directory. It finds `zipalign` and `apksigner` on `PATH` or under `$ANDROID_HOME`. The APK must already be zipaligned, as AGP's output is. `hotbox sign` adds the v2 and v3 signature and nothing else (no v1 signature, so the app needs minSdk 24 or later; `--alignment-preserved`), so the signed file is the unsigned one plus a signing block. That lets anyone who rebuilds the app from source reproduce the published file's digest.
 
 `app-release-unsigned.apk` is written as `app-release.apk` beside it. Any other name is written as `<name>-signed.apk`. hotbox verifies the output and prints its path and certificate digest.
 
