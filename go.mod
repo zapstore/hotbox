@@ -10,13 +10,14 @@ require (
 	github.com/charmbracelet/bubbletea v1.3.6
 	github.com/charmbracelet/huh v1.0.0
 	github.com/charmbracelet/lipgloss v1.1.0
+	github.com/charmbracelet/x/ansi v0.9.3
 	github.com/coder/websocket v1.8.15
 	github.com/decred/dcrd/dcrec/secp256k1/v4 v4.4.0
 	github.com/mattn/go-isatty v0.0.20
 	github.com/nbd-wtf/go-nostr v0.52.3
+	github.com/zapstore/vaultcore v0.1.0
 	golang.org/x/crypto v0.55.0
 	golang.org/x/sys v0.47.0
-	golang.org/x/term v0.45.0
 )
 
 require (
@@ -29,7 +30,6 @@ require (
 	github.com/bytedance/sonic/loader v0.2.4 // indirect
 	github.com/catppuccin/go v0.3.0 // indirect
 	github.com/charmbracelet/colorprofile v0.2.3-0.20250311203215-f60798e515dc // indirect
-	github.com/charmbracelet/x/ansi v0.9.3 // indirect
 	github.com/charmbracelet/x/cellbuf v0.0.13 // indirect
 	github.com/charmbracelet/x/exp/strings v0.0.0-20240722160745-212f7b056ed0 // indirect
 	github.com/charmbracelet/x/term v0.2.1 // indirect

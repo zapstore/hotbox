@@ -8,3 +8,6 @@
 /go.work
 /go.work.sum
 .env
+
+# Specs stay local
+SPEC.md

@@ -15,7 +15,7 @@ import (
 	"testing"
 	"time"
 
-	"vaultcore/vault"
+	"github.com/zapstore/vaultcore/vault"
 )
 
 func TestOpenRefusesMissingContent(t *testing.T) {

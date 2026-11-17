@@ -41,7 +41,7 @@ endif
 
 HOST_OS := $(shell go env GOOS)
 HOST_ARCH := $(shell go env GOARCH)
-LOCAL_BIN := $(HOME)/.local/bin
+LOCALBIN := $(HOME)/.local/bin
 
 .DEFAULT_GOAL := help
 .PHONY: help build test darwin-arm64 linux-arm64 linux-amd64 release clean
@@ -56,7 +56,7 @@ test: ## Unit tests (vaultcore_weakkdf)
 	go vet -tags vaultcore_weakkdf ./...
 	go test -tags vaultcore_weakkdf -count=1 ./...
 
-build: ## Build dist/$(NAME)-$(GOOS)-$(GOARCH); link when that matches this machine
+build: ## Build dist/<name>-<os>-<arch>; link it when built for this machine
 	mkdir -p dist
 	rm -f $(BIN) $(MODULE) \
 		dist/libhotbox-pkcs11-$(GOOS)-$(GOARCH).dylib \
@@ -67,25 +67,27 @@ build: ## Build dist/$(NAME)-$(GOOS)-$(GOARCH); link when that matches this mach
 		-o $(BIN) $(CMD)
 ifeq ($(GOOS)-$(GOARCH),$(HOST_OS)-$(HOST_ARCH))
 	ln -sfn $(BIN) $(NAME)
-	mkdir -p $(LOCAL_BIN)
-	ln -sfn $(abspath $(BIN)) $(LOCAL_BIN)/$(NAME)
+	@if [ -d "$(LOCALBIN)" ]; then \
+		ln -sfn "$(CURDIR)/$(BIN)" "$(LOCALBIN)/$(NAME)" || exit 1; \
+		echo "linked $(LOCALBIN)/$(NAME)"; \
+	fi
 endif
 
 darwin-arm64: ## macOS arm64 → dist/ only
 	$(MAKE) build GOOS=darwin GOARCH=arm64
 
-linux-arm64:
+linux-arm64: ## Linux arm64 → dist/ only
 	$(MAKE) build GOOS=linux GOARCH=arm64 \
 		CC="zig cc -target aarch64-linux-gnu" \
 		CXX="zig c++ -target aarch64-linux-gnu"
 
-linux-amd64:
+linux-amd64: ## Linux amd64 → dist/ only
 	$(MAKE) build GOOS=linux GOARCH=amd64 \
 		CC="zig cc -target x86_64-linux-gnu" \
 		CXX="zig c++ -target x86_64-linux-gnu"
 
 # Three binaries in dist/. Does not create the tag or the GitHub release.
-release:
+release: ## Three versioned binaries in dist/ (HEAD must be a tag)
 	$(MAKE) darwin-arm64
 	$(MAKE) linux-arm64
 	$(MAKE) linux-amd64
@@ -97,6 +99,10 @@ release:
 	@echo dist/$(NAME)-$(RELVER)-linux-arm64
 	@echo dist/$(NAME)-$(RELVER)-linux-amd64
 
-clean:
+clean: ## Remove dist/ and symlinks
 	rm -rf dist
 	rm -f $(NAME) $(MODULE)
+	@l="$(LOCALBIN)/$(NAME)"; \
+	if [ -L "$$l" ]; then \
+		case "$$(readlink "$$l")" in "$(CURDIR)/dist/"*) rm -f "$$l";; esac; \
+	fi

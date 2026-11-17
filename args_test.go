@@ -12,7 +12,7 @@ import (
 	nostr "github.com/nbd-wtf/go-nostr"
 	"github.com/nbd-wtf/go-nostr/nip19"
 	"github.com/zapstore/hotbox/profile"
-	"vaultcore/vault"
+	"github.com/zapstore/vaultcore/vault"
 )
 
 func TestVersionRequested(t *testing.T) {

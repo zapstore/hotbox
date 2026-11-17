@@ -28,11 +28,11 @@ Download the file for this machine, then `chmod +x` it:
 ## Build
 
 ```bash
-make
+make build
 ./hotbox
 ```
 
-`make` also links the binary into `~/.local/bin` when you build for this machine. `make darwin-arm64`, `make linux-arm64`, and `make linux-amd64` cross-compile.
+When you build for this machine, `make build` also links the binary into `~/.local/bin` if that directory exists. `make darwin-arm64`, `make linux-arm64`, and `make linux-amd64` cross-compile. `make help` lists every target.
 
 ## Create a vault
 

@@ -29,7 +29,7 @@ import (
 	"github.com/zapstore/hotbox/keystore"
 	"github.com/zapstore/hotbox/profile"
 	"github.com/zapstore/hotbox/token"
-	"vaultcore/vault"
+	"github.com/zapstore/vaultcore/vault"
 )
 
 // version is the build ref. The Makefile sets it with -X main.version only when HEAD is exactly a git tag.

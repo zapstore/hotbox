@@ -8,7 +8,7 @@ import (
 	"testing"
 
 	nostr "github.com/nbd-wtf/go-nostr"
-	"vaultcore/vault"
+	"github.com/zapstore/vaultcore/vault"
 )
 
 func TestOpenDirectoryContainer(t *testing.T) {
